@@ -1,0 +1,66 @@
+name: someting
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-someting}
+      POSTGRES_USER: ${POSTGRES_USER:-someting}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - ${HOSTING_ROOT_HOST:-./runtime}/postgres:/var/lib/postgresql/data
+    networks:
+      - hosting
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: hosting-caddy
+    restart: unless-stopped
+    environment:
+      MANAGEMENT_HOST: ${MANAGEMENT_HOST:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${HOSTING_ROOT_HOST:-./runtime}/caddy/sites:/etc/caddy/sites:ro
+      - ${HOSTING_ROOT_HOST:-./runtime}/caddy/data:/data
+      - ${HOSTING_ROOT_HOST:-./runtime}/caddy/config:/config
+    networks:
+      - hosting
+    depends_on:
+      control-plane:
+        condition: service_started
+
+  control-plane:
+    build: .
+    restart: unless-stopped
+    environment:
+      PORT: ${PORT:-3000}
+      DATABASE_URL: ${DATABASE_URL:-postgres://someting:change-me@postgres:5432/someting}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
+      HOSTING_ROOT: ${HOSTING_ROOT:-/srv/hosting}
+      CREATE_SITE_SCRIPT: ${CREATE_SITE_SCRIPT:-/srv/hosting/bin/create-site.sh}
+      DEPLOY_SCRIPT: ${DEPLOY_SCRIPT:-/srv/hosting/bin/deploy-site.sh}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOSTING_ROOT_HOST:-./runtime}:${HOSTING_ROOT:-/srv/hosting}
+      - ./scripts:${HOSTING_ROOT:-/srv/hosting}/bin:ro
+      - ./templates:${HOSTING_ROOT:-/srv/hosting}/templates:ro
+    networks:
+      - hosting
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  hosting:
+    name: someting_hosting

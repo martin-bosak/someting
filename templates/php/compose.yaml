@@ -1,0 +1,16 @@
+services:
+  app:
+    container_name: site-${SITE_SLUG}
+    build:
+      context: ./current
+      dockerfile: ../Dockerfile
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - hosting
+
+networks:
+  hosting:
+    external: true
+    name: someting_hosting

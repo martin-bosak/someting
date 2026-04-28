@@ -1,0 +1,20 @@
+services:
+  app:
+    container_name: site-${SITE_SLUG}
+    build:
+      context: ./current
+      dockerfile: ../Dockerfile
+      args:
+        BUILD_COMMAND: ${BUILD_COMMAND:-}
+    environment:
+      START_COMMAND: ${START_COMMAND:-python -m gunicorn app:app --bind 0.0.0.0:8080}
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - hosting
+
+networks:
+  hosting:
+    external: true
+    name: someting_hosting

@@ -1,0 +1,21 @@
+services:
+  app:
+    container_name: site-${SITE_SLUG}
+    build:
+      context: ./current
+      dockerfile: ../Dockerfile
+      args:
+        BUILD_COMMAND: ${BUILD_COMMAND:-}
+    environment:
+      PORT: 8080
+      START_COMMAND: ${START_COMMAND:-npm start}
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - hosting
+
+networks:
+  hosting:
+    external: true
+    name: someting_hosting
