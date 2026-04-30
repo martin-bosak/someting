@@ -33,6 +33,7 @@ install -o "${DEPLOY_USER}" -g docker -m 2775 -d \
   "${HOSTING_ROOT}" \
   "${HOSTING_ROOT}/sites" \
   "${HOSTING_ROOT}/caddy/sites" \
+  "${HOSTING_ROOT}/caddy/paths" \
   "${HOSTING_ROOT}/caddy/data" \
   "${HOSTING_ROOT}/caddy/config" \
   "${HOSTING_ROOT}/postgres" \

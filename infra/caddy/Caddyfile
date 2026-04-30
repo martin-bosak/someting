@@ -1,5 +1,6 @@
 {$MANAGEMENT_HOST:localhost} {
 	encode zstd gzip
+	import /etc/caddy/paths/*.caddy
 	reverse_proxy control-plane:3000
 }
 

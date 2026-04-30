@@ -25,6 +25,14 @@ export function runCommand(command: string, args: string[], timeoutMs = 10 * 60 
       output += chunk.toString();
     });
 
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({
+        code: 127,
+        output: output + error.message,
+      });
+    });
+
     child.on("close", (code) => {
       clearTimeout(timer);
       resolve({ code, output });

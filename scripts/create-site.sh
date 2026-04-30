@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 4 ]]; then
-  echo "Usage: create-site.sh <slug> <runtime: php|node|python|static> <repo-url> <branch> [build-command] [start-command]" >&2
+  echo "Usage: create-site.sh <slug> <runtime: php|node|python|static|html> <repo-url> <branch> [build-command] [start-command]" >&2
   exit 1
 fi
 

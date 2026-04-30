@@ -31,6 +31,7 @@ services:
     volumes:
       - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ${HOSTING_ROOT_HOST:-./runtime}/caddy/sites:/etc/caddy/sites:ro
+      - ${HOSTING_ROOT_HOST:-./runtime}/caddy/paths:/etc/caddy/paths:ro
       - ${HOSTING_ROOT_HOST:-./runtime}/caddy/data:/data
       - ${HOSTING_ROOT_HOST:-./runtime}/caddy/config:/config
     networks:
@@ -42,6 +43,8 @@ services:
   control-plane:
     build: .
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
     environment:
       PORT: ${PORT:-3000}
       DATABASE_URL: ${DATABASE_URL:-postgres://someting:change-me@postgres:5432/someting}

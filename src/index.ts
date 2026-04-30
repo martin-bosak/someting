@@ -3,6 +3,7 @@ import formbody from "@fastify/formbody";
 import { requireAdmin } from "./auth.js";
 import { config } from "./config.js";
 import { migrate, pool } from "./db.js";
+import { registerMcpHttpRoutes } from "./mcpHttp.js";
 import { registerRoutes } from "./routes.js";
 
 const app = Fastify({
@@ -12,7 +13,7 @@ const app = Fastify({
 await app.register(formbody);
 
 app.addHook("preHandler", async (request, reply) => {
-  if (request.url.startsWith("/healthz")) {
+  if (request.url.startsWith("/healthz") || request.url.startsWith("/login")) {
     return;
   }
 
@@ -25,6 +26,7 @@ app.setErrorHandler((error, _request, reply) => {
 });
 
 await migrate();
+await registerMcpHttpRoutes(app);
 await registerRoutes(app);
 
 const shutdown = async () => {

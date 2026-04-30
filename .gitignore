@@ -70,6 +70,12 @@ web_modules/
 .env.*
 !.env.example
 
+# Local MCP/client configuration may contain credentials
+.mcp.json
+
+# Generated deployment archives
+someting-deploy.tar.gz
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache

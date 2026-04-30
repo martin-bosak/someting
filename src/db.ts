@@ -8,11 +8,23 @@ export const pool = new pg.Pool({
 
 export async function migrate() {
   await pool.query(`
+    do $$
+    begin
+      if exists (
+        select 1
+        from information_schema.table_constraints
+        where constraint_name = 'sites_runtime_check'
+          and table_name = 'sites'
+      ) then
+        alter table sites drop constraint sites_runtime_check;
+      end if;
+    end $$;
+
     create table if not exists sites (
       id bigserial primary key,
       slug text not null unique check (slug ~ '^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$'),
       name text not null,
-      runtime text not null check (runtime in ('php', 'node', 'python', 'static')),
+      runtime text not null,
       repo_url text not null,
       branch text not null default 'main',
       build_command text,
@@ -22,6 +34,10 @@ export async function migrate() {
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
+
+    alter table sites
+      add constraint sites_runtime_check
+      check (runtime in ('php', 'node', 'python', 'static', 'html'));
 
     create table if not exists domains (
       id bigserial primary key,

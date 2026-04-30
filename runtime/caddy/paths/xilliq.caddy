@@ -1,0 +1,4 @@
+redir /sites/xilliq /sites/xilliq/
+handle_path /sites/xilliq/* {
+	reverse_proxy site-xilliq:8080
+}
