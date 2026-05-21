@@ -1,9 +1,15 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { config } from "./config.js";
 import { pool } from "./db.js";
 import { runCommand } from "./shell.js";
-import { deployAuthSchema, domainInputSchema, mailNoteSchema, siteInputSchema } from "./validators.js";
+import {
+  deployAuthSchema,
+  domainInputSchema,
+  mailNoteSchema,
+  siteInputSchema,
+  siteMetadataUpdateSchema,
+} from "./validators.js";
 
 export type SiteRow = {
   id: string;
@@ -69,6 +75,31 @@ export async function createSite(body: unknown) {
   return result.rows[0];
 }
 
+export async function updateSiteMetadata(siteId: number, body: unknown) {
+  const site = await getSiteById(siteId);
+  const input = siteMetadataUpdateSchema.parse(body);
+  await pool.query(
+    `update sites
+     set name = $1, repo_url = $2, branch = $3,
+         build_command = $4, start_command = $5, healthcheck_path = $6,
+         updated_at = now()
+     where id = $7`,
+    [
+      input.name,
+      input.repo_url,
+      input.branch,
+      input.build_command ?? null,
+      input.start_command ?? null,
+      input.healthcheck_path,
+      site.id,
+    ],
+  );
+
+  const result = await pool.query<SiteRow>("select * from sites where id = $1", [site.id]);
+
+  return result.rows[0];
+}
+
 export async function addDomain(body: unknown) {
   const input = domainInputSchema.parse(body);
   const result = await pool.query(
@@ -77,7 +108,18 @@ export async function addDomain(body: unknown) {
      returning *`,
     [input.site_id, input.hostname, input.is_primary],
   );
-  return result.rows[0];
+  const domain = result.rows[0];
+
+  const site = await pool.query<SiteRow>("select * from sites where id = $1", [input.site_id]);
+  if (site.rowCount === 1) {
+    try {
+      await applyRouteBySlug(site.rows[0].slug);
+    } catch (err) {
+      console.error(`[addDomain] auto apply-route failed for ${site.rows[0].slug}:`, err);
+    }
+  }
+
+  return domain;
 }
 
 export async function addMailNote(body: unknown) {
@@ -113,6 +155,7 @@ export async function getSiteBySlug(slug: string) {
 
 export async function deploySiteBySlug(slug: string) {
   const site = await getSiteBySlug(slug);
+  await syncSiteEnv(site);
   const deployment = await pool.query(
     "insert into deployments (site_id, status) values ($1, 'running') returning id",
     [site.id],
@@ -219,6 +262,58 @@ export async function getSiteLogsBySlug(slug: string, tail = 250) {
   return result.output || "No logs returned.";
 }
 
+export async function restartSiteBySlug(slug: string) {
+  const site = await getSiteBySlug(slug);
+  const result = await runCommand("docker", ["restart", `site-${slug}`], 60_000);
+  if (result.code !== 0) {
+    throw new Error(result.output || `docker restart site-${slug} failed`);
+  }
+  return { site, output: result.output };
+}
+
+export async function recreateSiteBySlug(slug: string) {
+  const site = await getSiteBySlug(slug);
+  await syncSiteEnv(site);
+  const siteDir = join(config.HOSTING_ROOT, "sites", site.slug);
+  const result = await runCommand(
+    "docker",
+    [
+      "compose",
+      "--env-file",
+      join(siteDir, "site.env"),
+      "-p",
+      `site-${slug}`,
+      "up",
+      "-d",
+      "--remove-orphans",
+    ],
+    5 * 60 * 1000,
+    { cwd: siteDir },
+  );
+  if (result.code !== 0) {
+    throw new Error(result.output || `recreate failed for site-${slug}`);
+  }
+  return { site, output: result.output };
+}
+
+export async function execInSiteBySlug(slug: string, command: string) {
+  await getSiteBySlug(slug);
+  if (!command.trim()) {
+    throw new Error("Command is required.");
+  }
+  const result = await runCommand(
+    "docker",
+    ["exec", `site-${slug}`, "sh", "-lc", command],
+    60_000,
+  );
+  return {
+    slug,
+    command,
+    exitCode: result.code,
+    output: result.output,
+  };
+}
+
 export async function readSiteEnvBySlug(slug: string) {
   const site = await getSiteBySlug(slug);
   const envPath = join(config.HOSTING_ROOT, "sites", site.slug, ".env");
@@ -293,12 +388,30 @@ export async function writeDeployAuthBySlug(slug: string, body: unknown) {
   return { site, mode: input.mode };
 }
 
+async function syncSiteEnv(site: SiteRow) {
+  const siteDir = join(config.HOSTING_ROOT, "sites", site.slug);
+  await mkdir(siteDir, { recursive: true });
+  const envPath = join(siteDir, "site.env");
+  const body =
+    `SITE_SLUG=${shellQuote(site.slug)}\n` +
+    `RUNTIME=${shellQuote(site.runtime)}\n` +
+    `REPO_URL=${shellQuote(site.repo_url)}\n` +
+    `BRANCH=${shellQuote(site.branch)}\n` +
+    `BUILD_COMMAND=${shellQuote(site.build_command ?? "")}\n` +
+    `START_COMMAND=${shellQuote(site.start_command ?? "")}\n` +
+    `SERVICE_PORT=8080\n`;
+  await writeFile(envPath, body, { mode: 0o600 });
+}
+
 async function writeCaddyRoute(slug: string, hostnames: string[]) {
   const sitesDir = join(config.HOSTING_ROOT, "caddy", "sites");
   await mkdir(sitesDir, { recursive: true });
 
   const body = `${hostnames.join(", ")} {
 	encode zstd gzip
+	log {
+		output file /data/access-${slug}.log
+	}
 	reverse_proxy site-${slug}:8080
 }
 `;
@@ -317,6 +430,96 @@ handle_path /sites/${slug}/* {
 `;
 
   await writeFile(join(pathsDir, `${slug}.caddy`), body, { mode: 0o644 });
+}
+
+export async function getVisitCount(slug: string) {
+  try {
+    const logPath = join(config.HOSTING_ROOT, "caddy", "data", `access-${slug}.log`);
+    const output = await runCommand("wc", ["-l", logPath]);
+    if (output.code === 0) {
+      return parseInt(output.output.split(" ")[0] || "0", 10);
+    }
+  } catch (e) {
+    // ignore
+  }
+  return 0;
+}
+
+// --- Persistent site storage (the ./shared dir mounted at /data in the container) ---
+
+function siteStorageRoot(slug: string) {
+  return resolve(config.HOSTING_ROOT, "sites", slug, "shared");
+}
+
+// Resolve a caller-supplied path against a site's shared/ dir, rejecting any
+// path that would escape it (e.g. "../" or absolute paths).
+function resolveStoragePath(slug: string, relPath: string) {
+  const root = siteStorageRoot(slug);
+  const target = resolve(root, relPath ?? "");
+  const rel = relative(root, target);
+  if (rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error("Path escapes the site storage directory.");
+  }
+  return { root, target };
+}
+
+export async function listSiteStorage(slug: string, subPath = "") {
+  await getSiteBySlug(slug);
+  const { root, target } = resolveStoragePath(slug, subPath);
+  await mkdir(root, { recursive: true });
+  const entries = await readdir(target, { withFileTypes: true }).catch((err) => {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw err;
+  });
+
+  const items = await Promise.all(
+    entries.map(async (entry) => {
+      const info = await stat(join(target, entry.name)).catch(() => null);
+      return {
+        name: entry.name,
+        type: entry.isDirectory() ? "directory" : "file",
+        size: info?.size ?? 0,
+      };
+    }),
+  );
+
+  return { slug, path: subPath || "/", entries: items };
+}
+
+export async function readSiteStorageFile(slug: string, filePath: string) {
+  await getSiteBySlug(slug);
+  const { target } = resolveStoragePath(slug, filePath);
+  const info = await stat(target);
+  if (info.isDirectory()) {
+    throw new Error(`${filePath} is a directory.`);
+  }
+  if (info.size > 1_000_000) {
+    throw new Error(`${filePath} is ${info.size} bytes; too large to read (limit 1 MB).`);
+  }
+  return readFile(target, "utf8");
+}
+
+export async function writeSiteStorageFile(slug: string, filePath: string, contents: string) {
+  await getSiteBySlug(slug);
+  const { root, target } = resolveStoragePath(slug, filePath);
+  if (target === root) {
+    throw new Error("A file path is required.");
+  }
+  await mkdir(join(target, ".."), { recursive: true });
+  await writeFile(target, contents);
+  return { slug, path: filePath, bytes: Buffer.byteLength(contents) };
+}
+
+export async function deleteSiteStorageEntry(slug: string, entryPath: string) {
+  await getSiteBySlug(slug);
+  const { root, target } = resolveStoragePath(slug, entryPath);
+  if (target === root) {
+    throw new Error("Refusing to delete the storage root.");
+  }
+  await rm(target, { recursive: true, force: true });
+  return { slug, path: entryPath, deleted: true };
 }
 
 function readEnvValue(contents: string, key: string) {

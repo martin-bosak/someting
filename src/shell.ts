@@ -5,10 +5,16 @@ export type CommandResult = {
   output: string;
 };
 
-export function runCommand(command: string, args: string[], timeoutMs = 10 * 60 * 1000): Promise<CommandResult> {
+export function runCommand(
+  command: string,
+  args: string[],
+  timeoutMs = 10 * 60 * 1000,
+  options: { cwd?: string } = {},
+): Promise<CommandResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
+      cwd: options.cwd,
     });
 
     let output = "";

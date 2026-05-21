@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import formbody from "@fastify/formbody";
+import { ensureConfiguredAdminUser } from "./adminUsers.js";
 import { requireAdmin } from "./auth.js";
 import { config } from "./config.js";
 import { migrate, pool } from "./db.js";
@@ -13,7 +14,11 @@ const app = Fastify({
 await app.register(formbody);
 
 app.addHook("preHandler", async (request, reply) => {
+  const pathOnly = request.url.split("?")[0] ?? "";
   if (request.url.startsWith("/healthz") || request.url.startsWith("/login")) {
+    return;
+  }
+  if (pathOnly === "/favicon.svg" || pathOnly === "/favicon.ico") {
     return;
   }
 
@@ -26,6 +31,7 @@ app.setErrorHandler((error, _request, reply) => {
 });
 
 await migrate();
+await ensureConfiguredAdminUser();
 await registerMcpHttpRoutes(app);
 await registerRoutes(app);
 

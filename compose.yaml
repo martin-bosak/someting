@@ -8,6 +8,10 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-someting}
       POSTGRES_USER: ${POSTGRES_USER:-someting}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    # Loopback-only host port so SSH tunnels can reach it from outside the
+    # Docker network without exposing Postgres to the public internet.
+    ports:
+      - "127.0.0.1:15432:5432"
     volumes:
       - ${HOSTING_ROOT_HOST:-./runtime}/postgres:/var/lib/postgresql/data
     networks:

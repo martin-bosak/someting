@@ -3,13 +3,27 @@ import { z } from "zod";
 import {
   addDomain,
   addMailNote,
+  applyPathRouteBySlug,
   applyRouteBySlug,
   createSite,
+  deleteSiteStorageEntry,
   deploySiteBySlug,
+  execInSiteBySlug,
+  getDeploymentLogById,
+  getSiteBySlug,
   getSiteLogsBySlug,
+  listDeploymentLogsForSite,
   listPlatformState,
+  listSiteStorage,
+  readDeployAuthBySlug,
   readSiteEnvBySlug,
+  readSiteStorageFile,
+  recreateSiteBySlug,
+  restartSiteBySlug,
+  updateSiteMetadata,
+  writeDeployAuthBySlug,
   writeSiteEnvBySlug,
+  writeSiteStorageFile,
 } from "./platform.js";
 
 export function createMcpServer() {
@@ -130,6 +144,223 @@ export function createMcpServer() {
       },
     },
     async ({ slug, contents }) => text(await writeSiteEnvBySlug(slug, contents)),
+  );
+
+  server.registerTool(
+    "get_site",
+    {
+      title: "Get site",
+      description: "Fetch a single site's metadata by slug.",
+      inputSchema: {
+        slug: z.string().min(1),
+      },
+    },
+    async ({ slug }) => text(await getSiteBySlug(slug)),
+  );
+
+  server.registerTool(
+    "update_site",
+    {
+      title: "Update site",
+      description:
+        "Update editable site metadata: name, repo_url, branch, build_command, start_command, healthcheck_path. Slug and runtime are fixed after provision.",
+      inputSchema: {
+        slug: z.string().min(1),
+        name: z.string().min(1),
+        repo_url: z.string().regex(/^(https:\/\/|git@|ssh:\/\/|upload:\/\/).+/),
+        branch: z.string().min(1),
+        build_command: z.string().optional().nullable(),
+        start_command: z.string().optional().nullable(),
+        healthcheck_path: z.string().startsWith("/").default("/"),
+      },
+    },
+    async ({ slug, ...rest }) => {
+      const site = await getSiteBySlug(slug);
+      return text(await updateSiteMetadata(Number(site.id), rest));
+    },
+  );
+
+  server.registerTool(
+    "list_deployments",
+    {
+      title: "List deployments",
+      description: "List the 20 most recent deployments for a site, with status and build output.",
+      inputSchema: {
+        slug: z.string().min(1),
+      },
+    },
+    async ({ slug }) => text(await listDeploymentLogsForSite(slug)),
+  );
+
+  server.registerTool(
+    "get_deployment_log",
+    {
+      title: "Get deployment log",
+      description:
+        "Fetch the full build/deploy output for a specific deployment by id. Use this to debug failed deploys — distinct from get_site_logs which returns runtime container logs.",
+      inputSchema: {
+        deployment_id: z.coerce.number().int().positive(),
+      },
+    },
+    async ({ deployment_id }) => text(await getDeploymentLogById(deployment_id)),
+  );
+
+  server.registerTool(
+    "apply_path_route",
+    {
+      title: "Apply path route",
+      description:
+        "Generate a Caddy path route that serves the site under /sites/<slug>/ on the main host, and reload Caddy. Use when the site has no dedicated domain.",
+      inputSchema: {
+        slug: z.string().min(1),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ slug }) => text(await applyPathRouteBySlug(slug)),
+  );
+
+  server.registerTool(
+    "read_deploy_auth",
+    {
+      title: "Read deploy auth",
+      description:
+        "Read Git deploy credentials configured for a site (https-token, ssh-key, or none). Treat returned token/private_key as secrets.",
+      inputSchema: {
+        slug: z.string().min(1),
+      },
+    },
+    async ({ slug }) => text(await readDeployAuthBySlug(slug)),
+  );
+
+  server.registerTool(
+    "write_deploy_auth",
+    {
+      title: "Write deploy auth",
+      description:
+        "Set Git deploy credentials for a site. mode=none clears credentials; mode=https-token requires token (and optional username); mode=ssh-key requires private_key.",
+      inputSchema: {
+        slug: z.string().min(1),
+        mode: z.enum(["none", "https-token", "ssh-key"]),
+        username: z.string().optional(),
+        token: z.string().optional(),
+        private_key: z.string().optional(),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ slug, ...rest }) => text(await writeDeployAuthBySlug(slug, rest)),
+  );
+
+  server.registerTool(
+    "restart_site",
+    {
+      title: "Restart site",
+      description: "Restart the running site container (same image, kicks the process). Does NOT pick up .env changes.",
+      inputSchema: {
+        slug: z.string().min(1),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ slug }) => text(await restartSiteBySlug(slug)),
+  );
+
+  server.registerTool(
+    "recreate_site",
+    {
+      title: "Recreate site",
+      description: "Recreate the site container without rebuilding the image. Picks up .env changes. Faster than deploy_site.",
+      inputSchema: {
+        slug: z.string().min(1),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ slug }) => text(await recreateSiteBySlug(slug)),
+  );
+
+  server.registerTool(
+    "exec_in_site",
+    {
+      title: "Exec in site container",
+      description: "Run a one-shot shell command inside a running site container and return stdout/stderr. Non-interactive (no PTY), 60s timeout.",
+      inputSchema: {
+        slug: z.string().min(1),
+        command: z.string().min(1),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ slug, command }) => text(await execInSiteBySlug(slug, command)),
+  );
+
+  server.registerTool(
+    "list_site_storage",
+    {
+      title: "List site storage",
+      description:
+        "List entries in a site's persistent storage directory (the ./shared dir, mounted at /data inside the site container). Data here survives redeploys.",
+      inputSchema: {
+        slug: z.string().min(1),
+        path: z.string().default("").describe("Subdirectory relative to the storage root; empty for the root."),
+      },
+    },
+    async ({ slug, path }) => text(await listSiteStorage(slug, path)),
+  );
+
+  server.registerTool(
+    "read_site_file",
+    {
+      title: "Read site storage file",
+      description:
+        "Read a UTF-8 text file from a site's persistent storage (/data). Max 1 MB. Path is relative to the storage root.",
+      inputSchema: {
+        slug: z.string().min(1),
+        path: z.string().min(1),
+      },
+    },
+    async ({ slug, path }) => text(await readSiteStorageFile(slug, path)),
+  );
+
+  server.registerTool(
+    "write_site_file",
+    {
+      title: "Write site storage file",
+      description:
+        "Create or overwrite a text file in a site's persistent storage (/data). Parent directories are created automatically. Path is relative to the storage root.",
+      inputSchema: {
+        slug: z.string().min(1),
+        path: z.string().min(1),
+        contents: z.string(),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ slug, path, contents }) => text(await writeSiteStorageFile(slug, path, contents)),
+  );
+
+  server.registerTool(
+    "delete_site_file",
+    {
+      title: "Delete site storage entry",
+      description:
+        "Delete a file or directory (recursively) from a site's persistent storage (/data). Path is relative to the storage root.",
+      inputSchema: {
+        slug: z.string().min(1),
+        path: z.string().min(1),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ slug, path }) => text(await deleteSiteStorageEntry(slug, path)),
   );
 
   server.registerTool(

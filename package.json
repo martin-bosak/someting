@@ -3,11 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "someting": "./dist/cli.js"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "mcp": "node dist/mcp.js",
+    "cli": "tsx src/cli.ts",
+    "admin:create": "node dist/registerAdmin.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

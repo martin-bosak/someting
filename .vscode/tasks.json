@@ -1,0 +1,115 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Someting: Start Local Platform",
+      "type": "shell",
+      "command": "docker compose up --build -d",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "detail": "Starts the Postgres, Caddy, and Control Plane containers in the background."
+    },
+    {
+      "label": "Someting: Stop Local Platform",
+      "type": "shell",
+      "command": "docker compose down",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "detail": "Stops and removes the platform containers."
+    },
+    {
+      "label": "Someting: View App Logs",
+      "type": "shell",
+      "command": "docker compose logs -f control-plane",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "detail": "Streams the logs from the Fastify management app."
+    },
+    {
+      "label": "Someting: Typecheck",
+      "type": "npm",
+      "script": "typecheck",
+      "problemMatcher": [
+        "$tsc"
+      ],
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "Someting: Deploy control plane to VPS (SSH + git + compose)",
+      "type": "shell",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File deploy/vps-deploy.ps1",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true
+      },
+      "detail": "SSH to the VPS; tries multiple paths for .git, then git pull --ff-only + docker compose up -d --build."
+    },
+    {
+      "label": "Someting: VPS rebuild only (compose, skip git)",
+      "type": "shell",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File deploy/vps-deploy.ps1 -SkipGitPull",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true
+      },
+      "detail": "Use when control-plane folder has compose.yaml but no .git (e.g. rsync/copy). Finds first compose.yaml among candidate paths."
+    },
+    {
+      "label": "Someting: Sync workspace to VPS and rebuild (recommended)",
+      "type": "shell",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File deploy/vps-sync-and-rebuild.ps1",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true
+      },
+      "detail": "Tar excludes node_modules/runtime/dist/.git/.env then scp extract to /opt/someting (or SOMETING_SYNC_REMOTE_DIR) and docker compose up -d --build."
+    },
+    {
+      "label": "Someting: Open SSH session on VPS",
+      "type": "shell",
+      "command": "deploy\\someting.cmd",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "detail": "Interactive SSH via deploy/someting.cmd. Edit that file for host or key."
+    }
+  ]
+}

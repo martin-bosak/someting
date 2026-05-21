@@ -1,3 +1,6 @@
+# TLS: Point MANAGEMENT_HOST at a public DNS name (no "http://" prefix). Open TCP 80+443 (+ UDP 443).
+# Sites get certs automatically too when domains resolve here — see docs/https.md
+
 {$MANAGEMENT_HOST:localhost} {
 	encode zstd gzip
 	import /etc/caddy/paths/*.caddy

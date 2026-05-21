@@ -1,5 +1,6 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { isActiveAdminUser, verifyAdminUser } from "./adminUsers.js";
 import { config } from "./config.js";
 
 const sessionCookieName = "someting_session";
@@ -16,8 +17,8 @@ function safeEqual(left: string, right: string) {
   return timingSafeEqual(leftBuffer, rightBuffer);
 }
 
-export function verifyAdminCredentials(username: string, password: string) {
-  return safeEqual(username, config.ADMIN_USERNAME) && safeEqual(password, config.ADMIN_PASSWORD);
+export async function verifyAdminCredentials(username: string, password: string) {
+  return verifyAdminUser(username, password);
 }
 
 export async function requireAdmin(request: FastifyRequest, reply: FastifyReply) {
@@ -29,14 +30,14 @@ export async function requireAdmin(request: FastifyRequest, reply: FastifyReply)
     const username = decoded.slice(0, separator);
     const password = decoded.slice(separator + 1);
 
-    if (verifyAdminCredentials(username, password)) {
+    if (await verifyAdminCredentials(username, password)) {
       return;
     }
 
     return unauthorized(request, reply);
   }
 
-  if (hasValidSession(request)) {
+  if (await hasValidSession(request)) {
     return;
   }
 
@@ -58,7 +59,7 @@ export function clearSessionCookie() {
   return `${sessionCookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`;
 }
 
-function hasValidSession(request: FastifyRequest) {
+async function hasValidSession(request: FastifyRequest) {
   const token = parseCookies(request.headers.cookie ?? "")[sessionCookieName];
   if (!token) {
     return false;
@@ -75,7 +76,11 @@ function hasValidSession(request: FastifyRequest) {
       expiresAt?: number;
     };
 
-    return session.username === config.ADMIN_USERNAME && Number(session.expiresAt) > Math.floor(Date.now() / 1000);
+    return (
+      typeof session.username === "string" &&
+      Number(session.expiresAt) > Math.floor(Date.now() / 1000) &&
+      (await isActiveAdminUser(session.username))
+    );
   } catch {
     return false;
   }

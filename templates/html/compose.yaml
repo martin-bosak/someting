@@ -4,6 +4,9 @@ services:
     build:
       context: ./current
       dockerfile: ../Dockerfile
+    volumes:
+      # Persistent storage; survives redeploys. Host: sites/<slug>/shared
+      - ./shared:/data
     restart: unless-stopped
     networks:
       - hosting

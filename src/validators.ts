@@ -13,6 +13,16 @@ export const siteInputSchema = z.object({
   healthcheck_path: z.string().startsWith("/").default("/"),
 });
 
+/** DB metadata only; slug/runtime are fixed after provision (changing them needs different tooling). */
+export const siteMetadataUpdateSchema = z.object({
+  name: z.string().min(1),
+  repo_url: z.string().regex(/^(https:\/\/|git@|ssh:\/\/|upload:\/\/).+/),
+  branch: z.string().min(1),
+  build_command: z.string().optional().nullable(),
+  start_command: z.string().optional().nullable(),
+  healthcheck_path: z.string().startsWith("/").default("/"),
+});
+
 export const domainInputSchema = z.object({
   site_id: z.coerce.number().int().positive(),
   hostname: z

@@ -6,6 +6,9 @@ services:
       dockerfile: ../Dockerfile
       args:
         BUILD_COMMAND: ${BUILD_COMMAND:-npm run build}
+    volumes:
+      # Persistent storage; survives redeploys. Host: sites/<slug>/shared
+      - ./shared:/data
     restart: unless-stopped
     networks:
       - hosting

@@ -10,6 +10,9 @@ services:
       START_COMMAND: ${START_COMMAND:-python -m gunicorn app:app --bind 0.0.0.0:8080}
     env_file:
       - .env
+    volumes:
+      # Persistent storage; survives redeploys. Host: sites/<slug>/shared
+      - ./shared:/data
     restart: unless-stopped
     networks:
       - hosting

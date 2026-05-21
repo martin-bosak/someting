@@ -52,6 +52,17 @@ ssh -L 3000:127.0.0.1:3000 root@your-vps
 
 Then open `http://localhost:3000/admin`.
 
+## HTTPS (production)
+
+**Caddy issues TLS certificates automatically** for:
+
+- **`MANAGEMENT_HOST`** (the admin reverse-proxy block in `infra/caddy/Caddyfile`), and  
+- Every hostname you attach to a site and **Apply route** (`caddy/sites/*.caddy`).
+
+On the VPS, set **`MANAGEMENT_HOST`** to your real admin hostname (e.g. `someting.somesoft.net`): no `http://` prefix and not the bare IP. Ensure **TCP 80 and 443** (and UDP 443 if you care about HTTP/3) are open so Let's Encrypt can validate. Use **`https://`** in the browser.
+
+Full checklist and troubleshooting: [docs/https.md](docs/https.md).
+
 ## First Site Flow
 
 ```bash
@@ -80,6 +91,28 @@ http://95.217.223.133/sites/my-page/
 ```
 
 See `docs/path-routing.md`.
+
+## Persistent Storage
+
+Every site container gets one writable directory that survives redeploys:
+**`/data`** inside the container, backed by `sites/<slug>/shared/` on the host.
+
+Everything else is ephemeral — each deploy is a fresh `git clone` and image
+rebuild, so anything written outside `/data` is wiped. Site authors should write
+uploads, SQLite databases, and generated files under `/data` (read the path
+from a `DATA_DIR` env var rather than hardcoding it).
+
+The directory is created by `create-site.sh` and bind-mounted via each runtime
+template's `compose.yaml` (`./shared:/data`). Manage its contents from the admin
+app (the **Storage** button on a site card) or over MCP (`list_site_storage`,
+`read_site_file`, `write_site_file`, `delete_site_file`).
+
+**`HOSTING_ROOT` and `HOSTING_ROOT_HOST` must be identical absolute paths** for
+this to work — the `./shared` bind mount is resolved by the host Docker daemon,
+not the control-plane container. Production uses `/srv/hosting` for both. The
+local-dev value `HOSTING_ROOT_HOST=./runtime` differs from the in-container
+`HOSTING_ROOT`, so per-site `/data` mounts do not resolve locally; set both to
+the same absolute path if you need to exercise site storage on a dev machine.
 
 ## MCP Access
 
