@@ -6,6 +6,7 @@ import {
   applyPathRouteBySlug,
   applyRouteBySlug,
   createSite,
+  provisionDatabase,
   deleteSiteStorageEntry,
   deploySiteBySlug,
   execInSiteBySlug,
@@ -106,6 +107,11 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post("/admin/mail-notes", async (request, reply) => {
     await addMailNote(request.body);
     return reply.redirect("/admin");
+  });
+
+  app.post("/admin/databases", async (request, reply) => {
+    const result = await provisionDatabase(request.body);
+    return reply.type("application/json").send(result);
   });
 
   app.post("/admin/sites/:id/deploy", async (request, reply) => {

@@ -6,6 +6,7 @@ import {
   applyPathRouteBySlug,
   applyRouteBySlug,
   createSite,
+  provisionDatabase,
   deleteSiteStorageEntry,
   deploySiteBySlug,
   execInSiteBySlug,
@@ -361,6 +362,28 @@ export function createMcpServer() {
       },
     },
     async ({ slug, path }) => text(await deleteSiteStorageEntry(slug, path)),
+  );
+
+  server.registerTool(
+    "provision_database",
+    {
+      title: "Provision database",
+      description:
+        "Create a new Postgres database and an owning login role in the shared cluster, intended for a hosted site. Returns the credentials and a connection string (host=postgres on the hosting Docker network). Treat the returned password as a secret. If password is omitted a random one is generated.",
+      inputSchema: {
+        name: z
+          .string()
+          .regex(/^[a-z][a-z0-9_]{1,62}$/)
+          .describe(
+            "Used as both the database name and the role name. Lowercase letters, digits, underscores; must start with a letter; 2-63 chars.",
+          ),
+        password: z.string().min(8).optional(),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async (input) => text(await provisionDatabase(input)),
   );
 
   server.registerTool(

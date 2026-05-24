@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { config } from "./config.js";
@@ -131,6 +132,66 @@ export async function addMailNote(body: unknown) {
     [input.domain, input.mode, input.provider, input.notes],
   );
   return result.rows[0];
+}
+
+// Provision a fresh database + owning role in the shared Postgres instance for
+// a hosted site to use. Uses the control-plane's own DATABASE_URL, which
+// connects as the POSTGRES_USER superuser created by compose.yaml — so it has
+// CREATE ROLE / CREATE DATABASE rights.
+const DB_NAME_RE = /^[a-z][a-z0-9_]{1,62}$/;
+
+export async function provisionDatabase(body: unknown) {
+  const input = body as { name?: unknown; password?: unknown };
+  const name = typeof input.name === "string" ? input.name : "";
+  if (!DB_NAME_RE.test(name)) {
+    throw new Error(
+      "Database name must start with a lowercase letter and contain only lowercase letters, digits, and underscores (2–63 chars).",
+    );
+  }
+
+  const supplied = typeof input.password === "string" ? input.password.trim() : "";
+  const password = supplied || randomBytes(18).toString("base64url");
+
+  const client = await pool.connect();
+  try {
+    // CREATE ROLE/DATABASE don't accept bind parameters, so build the SQL
+    // server-side with format() to get correct quoting of both the identifier
+    // and the password literal.
+    const roleSql = await client.query<{ sql: string }>(
+      "select format('create role %I with login password %L', $1::text, $2::text) as sql",
+      [name, password],
+    );
+    await client.query(roleSql.rows[0].sql);
+
+    try {
+      const dbSql = await client.query<{ sql: string }>(
+        "select format('create database %I owner %I', $1::text, $2::text) as sql",
+        [name, name],
+      );
+      await client.query(dbSql.rows[0].sql);
+    } catch (err) {
+      const cleanupSql = await client.query<{ sql: string }>(
+        "select format('drop role if exists %I', $1::text) as sql",
+        [name],
+      );
+      await client.query(cleanupSql.rows[0].sql).catch(() => {});
+      throw err;
+    }
+  } finally {
+    client.release();
+  }
+
+  const host = "postgres";
+  const port = 5432;
+  return {
+    name,
+    username: name,
+    password,
+    host,
+    port,
+    database: name,
+    connection_string: `postgres://${name}:${encodeURIComponent(password)}@${host}:${port}/${name}`,
+  };
 }
 
 export async function getSiteById(id: number) {
