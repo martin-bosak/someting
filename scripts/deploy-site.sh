@@ -33,7 +33,11 @@ fi
 mkdir -p "${SITE_DIR}/releases" "${HOSTING_ROOT}/logs"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
-echo "[$(date -Iseconds)] Deploying ${SLUG} from ${REPO_URL}#${BRANCH}"
+if [[ -n "${REPO_SUBDIR:-}" ]]; then
+  echo "[$(date -Iseconds)] Deploying ${SLUG} from ${REPO_URL}#${BRANCH} (subdir: ${REPO_SUBDIR})"
+else
+  echo "[$(date -Iseconds)] Deploying ${SLUG} from ${REPO_URL}#${BRANCH}"
+fi
 
 if [[ "${REPO_URL}" == upload://* ]]; then
   if [[ ! -e "${SITE_DIR}/current" ]]; then
@@ -64,7 +68,16 @@ EOF_ASKPASS
   else
     GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${RELEASE_DIR}"
   fi
-  ln -sfn "${RELEASE_DIR}" "${SITE_DIR}/current"
+  if [[ -n "${REPO_SUBDIR:-}" ]]; then
+    SUBDIR_PATH="${RELEASE_DIR}/${REPO_SUBDIR}"
+    if [[ ! -d "${SUBDIR_PATH}" ]]; then
+      echo "REPO_SUBDIR ${REPO_SUBDIR} does not exist in the cloned repository." >&2
+      exit 1
+    fi
+    ln -sfn "${SUBDIR_PATH}" "${SITE_DIR}/current"
+  else
+    ln -sfn "${RELEASE_DIR}" "${SITE_DIR}/current"
+  fi
 fi
 
 if [[ ! -f "${SITE_DIR}/Dockerfile" || ! -f "${SITE_DIR}/compose.yaml" ]]; then

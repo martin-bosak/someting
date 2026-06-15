@@ -7,13 +7,16 @@ import {
   applyRouteBySlug,
   createSite,
   provisionDatabase,
+  deleteSiteBySlug,
   deleteSiteStorageEntry,
   deploySiteBySlug,
   execInSiteBySlug,
   getDeploymentLogById,
   getSiteById,
   getSiteLogsBySlug,
-  getVisitCount,
+  getWeeklyVisits,
+  listDeploymentLogsForSite,
+  type WeeklyVisits,
   listPlatformState,
   listSiteStorage,
   readDeployAuthBySlug,
@@ -28,6 +31,18 @@ import {
   writeSiteStorageFile,
 } from "./platform.js";
 import { FAVICON_SVG, renderFaviconTags } from "./favicon.js";
+import { createWedosARecord } from "./wapi.js";
+import { createActive24ARecord } from "./active24.js";
+import { listDnsAttempts, recordDnsAttempt, type DnsAttempt } from "./dnsLog.js";
+import { listActivity, listActivityForSite, recordActivity, type ActivityRow } from "./activityLog.js";
+import {
+  addDnsDomain,
+  DNS_PROVIDERS,
+  listDnsDomains,
+  listDomainsForProvider,
+  removeDnsDomain,
+  type DnsDomainRow,
+} from "./dnsConfig.js";
 
 export async function registerRoutes(app: FastifyInstance) {
   app.get("/healthz", async () => ({ ok: true }));
@@ -67,16 +82,33 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.get("/admin", async (_request, reply) => {
     const state = await listPlatformState();
-    return reply.type("text/html").send(renderAdminDashboard(state.sites, state.domains, state.deployments, state.mailNotes));
+    return reply
+      .type("text/html")
+      .send(renderAdminDashboard(state.sites, state.domains, state.deployments, state.mailNotes));
+  });
+
+  app.get("/admin/domains", async (_request, reply) => {
+    const state = await listPlatformState();
+    const dnsByProvider = await Promise.all(
+      DNS_PROVIDERS.map(async (provider) => ({
+        provider,
+        domains: await listDomainsForProvider(provider.id),
+      })),
+    );
+    return reply
+      .type("text/html")
+      .send(renderDomainsPage(state.sites, state.domains, dnsByProvider));
   });
 
   app.get("/admin/websites", async (_request, reply) => {
     const state = await listPlatformState();
-    const visitCounts: Record<string, number> = {};
-    for (const site of state.sites) {
-      visitCounts[site.slug] = await getVisitCount(site.slug);
-    }
-    return reply.type("text/html").send(renderWebsitesPage(state.sites, state.domains, visitCounts));
+    const visits: Record<string, WeeklyVisits> = {};
+    await Promise.all(
+      state.sites.map(async (site) => {
+        visits[site.slug] = await getWeeklyVisits(site.slug);
+      }),
+    );
+    return reply.type("text/html").send(renderWebsitesPage(state.sites, state.domains, visits));
   });
 
   app.get("/admin/sites/new", async (_request, reply) => {
@@ -88,9 +120,35 @@ export async function registerRoutes(app: FastifyInstance) {
     return reply.type("text/html").send(renderSiteEditorPage(site, `/admin/sites/${site.id}/edit`));
   });
 
+  app.get("/admin/sites/:id/detail", async (request, reply) => {
+    const site = await getSite(request.params);
+    const state = await listPlatformState();
+    const siteDomains = state.domains.filter((d) => d.site_id === site.id);
+    const [visits, deployments, activity] = await Promise.all([
+      getWeeklyVisits(site.slug),
+      listDeploymentLogsForSite(site.slug).catch(() => []),
+      listActivityForSite(site.slug, 40).catch(() => []),
+    ]);
+    let containerLogs = "";
+    try {
+      containerLogs = await getSiteLogsBySlug(site.slug, 200);
+    } catch (err) {
+      containerLogs = err instanceof Error ? err.message : String(err);
+    }
+    return reply
+      .type("text/html")
+      .send(renderSiteDetailPage(site, siteDomains, visits, deployments, activity, containerLogs));
+  });
+
   app.post("/admin/sites/:id/update", async (request, reply) => {
     const site = await getSite(request.params);
     await updateSiteMetadata(Number(site.id), request.body);
+    return reply.redirect("/admin/websites");
+  });
+
+  app.post("/admin/sites/:id/delete", async (request, reply) => {
+    const site = await getSite(request.params);
+    await deleteSiteBySlug(site.slug);
     return reply.redirect("/admin/websites");
   });
 
@@ -101,12 +159,166 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.post("/admin/domains", async (request, reply) => {
     await addDomain(request.body);
-    return reply.redirect("/admin/websites");
+    return reply.redirect("/admin/domains");
   });
 
   app.post("/admin/mail-notes", async (request, reply) => {
     await addMailNote(request.body);
     return reply.redirect("/admin");
+  });
+
+  app.get("/admin/config", async (_request, reply) => {
+    const domains = await listDnsDomains();
+    return reply.type("text/html").send(renderConfigPage(domains));
+  });
+
+  app.post("/admin/config/dns-domains", async (request, reply) => {
+    const body = request.body as { domain?: string; provider?: string };
+    try {
+      await addDnsDomain(body.domain ?? "", body.provider ?? "");
+      await recordActivity({
+        category: "dns",
+        action: "Assign domain to provider",
+        target: (body.domain ?? "").toLowerCase(),
+        detail: `provider=${body.provider ?? ""}`,
+      });
+      return reply.redirect("/admin/config");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const domains = await listDnsDomains();
+      return reply.code(400).type("text/html").send(renderConfigPage(domains, message));
+    }
+  });
+
+  app.post("/admin/config/dns-domains/:id/delete", async (request, reply) => {
+    const raw = String((request.params as { id?: string }).id ?? "");
+    if (/^\d+$/.test(raw)) {
+      await removeDnsDomain(Number(raw));
+      await recordActivity({
+        category: "dns",
+        action: "Unassign domain from provider",
+        target: `dns_domain#${raw}`,
+      });
+    }
+    return reply.redirect("/admin/config");
+  });
+
+  app.post("/admin/dns/wedos/a-record", async (request, reply) => {
+    const body = request.body as { domain?: string; subdomain?: string; ip?: string; ttl?: string };
+    const started = Date.now();
+    const domain = (body.domain ?? "").toLowerCase();
+    const subdomain = (body.subdomain ?? "").toLowerCase();
+    try {
+      const result = await createWedosARecord({
+        domain,
+        subdomain,
+        ip: body.ip,
+        ttl: body.ttl ? Number(body.ttl) : undefined,
+      });
+      recordDnsAttempt({
+        at: new Date().toISOString(),
+        provider: "wedos",
+        domain: result.domain,
+        subdomain: result.subdomain,
+        hostname: result.hostname,
+        ip: result.ip,
+        ttl: result.ttl,
+        ok: true,
+        durationMs: Date.now() - started,
+      });
+      await recordActivity({
+        category: "dns",
+        action: "Create A record (Wedos)",
+        target: result.hostname,
+        status: "ok",
+        detail: `${result.hostname} → ${result.ip} (TTL ${result.ttl})`,
+        durationMs: Date.now() - started,
+      });
+      return reply.type("application/json").send({ ok: true, ...result });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      recordDnsAttempt({
+        at: new Date().toISOString(),
+        provider: "wedos",
+        domain,
+        subdomain,
+        hostname: subdomain && domain ? `${subdomain}.${domain}` : domain || subdomain,
+        ip: body.ip,
+        ok: false,
+        error: message,
+        durationMs: Date.now() - started,
+      });
+      await recordActivity({
+        category: "dns",
+        action: "Create A record (Wedos)",
+        target: subdomain && domain ? `${subdomain}.${domain}` : domain || subdomain,
+        status: "error",
+        detail: message,
+        durationMs: Date.now() - started,
+      });
+      return reply.code(400).type("application/json").send({ ok: false, error: message });
+    }
+  });
+
+  app.post("/admin/dns/active24/a-record", async (request, reply) => {
+    const body = request.body as { domain?: string; subdomain?: string; ip?: string; ttl?: string };
+    const started = Date.now();
+    const domain = (body.domain ?? "").toLowerCase();
+    const subdomain = (body.subdomain ?? "").toLowerCase();
+    try {
+      const result = await createActive24ARecord({
+        domain,
+        subdomain,
+        ip: body.ip,
+        ttl: body.ttl ? Number(body.ttl) : undefined,
+      });
+      recordDnsAttempt({
+        at: new Date().toISOString(),
+        provider: "active24",
+        domain: result.domain,
+        subdomain: result.subdomain,
+        hostname: result.hostname,
+        ip: result.ip,
+        ttl: result.ttl,
+        ok: true,
+        durationMs: Date.now() - started,
+      });
+      await recordActivity({
+        category: "dns",
+        action: "Create A record (Active24)",
+        target: result.hostname,
+        status: "ok",
+        detail: `${result.hostname} → ${result.ip} (TTL ${result.ttl})`,
+        durationMs: Date.now() - started,
+      });
+      return reply.type("application/json").send({ ok: true, ...result });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      recordDnsAttempt({
+        at: new Date().toISOString(),
+        provider: "active24",
+        domain,
+        subdomain,
+        hostname: subdomain && domain ? `${subdomain}.${domain}` : domain || subdomain,
+        ip: body.ip,
+        ok: false,
+        error: message,
+        durationMs: Date.now() - started,
+      });
+      await recordActivity({
+        category: "dns",
+        action: "Create A record (Active24)",
+        target: subdomain && domain ? `${subdomain}.${domain}` : domain || subdomain,
+        status: "error",
+        detail: message,
+        durationMs: Date.now() - started,
+      });
+      return reply.code(400).type("application/json").send({ ok: false, error: message });
+    }
+  });
+
+  app.get("/admin/dns/log.json", async (_request, reply) => {
+    return reply.type("application/json").send({ attempts: listDnsAttempts() });
   });
 
   app.post("/admin/databases", async (request, reply) => {
@@ -174,6 +386,24 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get("/admin/deployments", async (_request, reply) => {
     const state = await listPlatformState();
     return reply.type("text/html").send(renderDeploymentsPage(state.deployments));
+  });
+
+  app.get("/admin/logs", async (request, reply) => {
+    const query = request.query as { category?: string };
+    const category = ACTIVITY_CATEGORIES.includes(query.category as any)
+      ? (query.category as ActivityRow["category"])
+      : undefined;
+    const entries = await listActivity({ limit: 300, category });
+    return reply.type("text/html").send(renderLogsPage(entries, category));
+  });
+
+  app.get("/admin/logs.json", async (request, reply) => {
+    const query = request.query as { category?: string };
+    const category = ACTIVITY_CATEGORIES.includes(query.category as any)
+      ? (query.category as ActivityRow["category"])
+      : undefined;
+    const entries = await listActivity({ limit: 300, category });
+    return reply.type("application/json").send({ entries });
   });
 
   app.get("/admin/deployments/:id/logs", async (request, reply) => {
@@ -280,7 +510,10 @@ ${renderFaviconTags()}
       <div class="menu-links">
         <a href="/admin" class="${currentPath === "/admin" ? "active" : ""}">Dashboard</a>
         <a href="/admin/websites" class="${websitesNavActive(currentPath) ? "active" : ""}">Websites</a>
+        <a href="/admin/domains" class="${currentPath.startsWith("/admin/domains") ? "active" : ""}">Domains</a>
         <a href="/admin/deployments" class="${currentPath.startsWith("/admin/deployments") ? "active" : ""}">Deployments</a>
+        <a href="/admin/logs" class="${currentPath.startsWith("/admin/logs") ? "active" : ""}">Logs</a>
+        <a href="/admin/config" class="${currentPath.startsWith("/admin/config") ? "active" : ""}">Config</a>
       </div>
     </div>
   </nav>
@@ -299,7 +532,12 @@ ${renderFaviconTags()}
 </html>`;
 }
 
-function renderAdminDashboard(sites: SiteRow[], domains: any[], deployments: any[], mailNotes: any[]) {
+function renderAdminDashboard(
+  sites: SiteRow[],
+  domains: any[],
+  deployments: any[],
+  mailNotes: any[],
+) {
   const latestDeployment = deployments[0];
 
   const content = `
@@ -310,20 +548,18 @@ function renderAdminDashboard(sites: SiteRow[], domains: any[], deployments: any
       ${renderStatCard("Last Deploy", latestDeployment?.status ?? "None", latestDeployment ? `${latestDeployment.slug} at ${formatDate(latestDeployment.started_at)}` : "No deploys yet", "rose")}
     </section>
 
-    <section class="form-grid">
-      <section class="paper card paper-lavender">
-        <p class="eyebrow">Traffic map</p>
-        <h2>Add Domain</h2>
-        <form method="post" action="/admin/domains">
-          <label>Site <select name="site_id">${sites.map((site) => `<option value="${site.id}">${escapeHtml(site.slug)}</option>`).join("")}</select></label>
-          <label>Hostname <input name="hostname" placeholder="example.com" required></label>
-          <label class="check-row"><input type="checkbox" name="is_primary" value="true"> Primary domain</label>
-          <button class="button">Add domain</button>
-        </form>
-        <h3>Configured Domains</h3>
-        ${renderDomainList(domains)}
-      </section>
+    <section class="panel paper">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Hosted</p>
+          <h2>Sites</h2>
+        </div>
+        <a class="button button-ghost" href="/admin/sites/new">Add a site</a>
+      </div>
+      ${renderDashboardSitesList(sites, domains)}
+    </section>
 
+    <section class="form-grid">
       <section class="paper card paper-sky">
         <p class="eyebrow">Inbox decisions</p>
         <h2>Mail Notes</h2>
@@ -343,6 +579,136 @@ function renderAdminDashboard(sites: SiteRow[], domains: any[], deployments: any
   return renderAdminLayout("Someting Admin", "/admin", content, sites.length, domains.length);
 }
 
+function renderDashboardSitesList(sites: SiteRow[], domains: any[]) {
+  if (sites.length === 0) {
+    return `<div class="empty-state">No sites yet. <a href="/admin/sites/new">Create your first site</a>.</div>`;
+  }
+
+  const rows = sites
+    .map((site) => {
+      const siteDomains = domains.filter((d) => d.site_id === site.id);
+      const primary = siteDomains.find((d) => d.is_primary) ?? siteDomains[0];
+      const domainHtml = primary
+        ? `<a class="dash-site-domain" href="https://${escapeHtml(primary.hostname)}" target="_blank">${escapeHtml(primary.hostname)}</a>`
+        : `<span class="muted">No domain</span>`;
+
+      return `<li class="dash-site">
+        <div class="dash-site-main">
+          <span class="status-dot ${statusTone(site.status)}" title="${escapeHtml(site.status)}"></span>
+          <div class="dash-site-id">
+            <strong>${escapeHtml(site.name || site.slug)}</strong>
+            <small class="muted">${escapeHtml(site.slug)} · ${escapeHtml(site.runtime)}</small>
+          </div>
+        </div>
+        <div class="dash-site-mid">
+          <span class="status-pill ${statusTone(site.status)}">${escapeHtml(site.status)}</span>
+          ${domainHtml}
+        </div>
+        <div class="dash-site-actions">
+          <a class="button button-soft" href="/admin/sites/${site.id}/detail">Config</a>
+        </div>
+      </li>`;
+    })
+    .join("");
+
+  return `<ul class="dash-site-list">${rows}</ul>`;
+}
+
+function renderDomainsPage(
+  sites: SiteRow[],
+  domains: any[],
+  dnsByProvider: { provider: (typeof DNS_PROVIDERS)[number]; domains: string[] }[],
+) {
+  const dnsCards = dnsByProvider
+    .map(({ provider, domains: providerDomains }) =>
+      renderDnsCard({
+        eyebrow: `${provider.label} DNS`,
+        title: "Create A Record",
+        hint: `${provider.hint} Manage which domains appear here on the <a href="/admin/config">Config</a> page.`,
+        domains: providerDomains,
+        endpoint: provider.endpoint,
+        tone: provider.tone,
+      }),
+    )
+    .join("\n");
+
+  const content = `
+    <section class="form-grid">
+      <section class="paper card paper-lavender">
+        <p class="eyebrow">Traffic map</p>
+        <h2>Add Domain</h2>
+        <form method="post" action="/admin/domains">
+          <label>Site <select name="site_id">${sites.map((site) => `<option value="${site.id}">${escapeHtml(site.slug)}</option>`).join("")}</select></label>
+          <label>Hostname <input name="hostname" placeholder="example.com" required></label>
+          <label class="check-row"><input type="checkbox" name="is_primary" value="true"> Primary domain</label>
+          <button class="button">Add domain</button>
+        </form>
+        <h3>Configured Domains</h3>
+        ${renderDomainList(domains)}
+      </section>
+
+      ${dnsCards}
+
+      ${renderDnsAutomationScript()}
+    </section>
+
+    ${renderDnsLogPanel()}`;
+
+  return renderAdminLayout("Domains", "/admin/domains", content, sites.length, domains.length);
+}
+
+function renderConfigPage(dnsDomains: DnsDomainRow[], error = "") {
+  const providerOptions = DNS_PROVIDERS.map(
+    (provider) => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.label)}</option>`,
+  ).join("");
+
+  const providerCards = DNS_PROVIDERS.map((provider) => {
+    const rows = dnsDomains.filter((row) => row.provider === provider.id);
+    const list = rows.length === 0
+      ? `<div class="mini-empty">No domains assigned to ${escapeHtml(provider.label)}.</div>`
+      : `<ul class="stack-list">${rows
+          .map(
+            (row) => `<li class="config-domain-row">
+              <span>${escapeHtml(row.domain)}</span>
+              <form method="post" action="/admin/config/dns-domains/${row.id}/delete" onsubmit="return confirm('Remove ${escapeHtml(row.domain)} from ${escapeHtml(provider.label)}? Its A-record button disappears; existing DNS records are not touched.');">
+                <button class="button button-danger">Remove</button>
+              </form>
+            </li>`,
+          )
+          .join("")}</ul>`;
+
+    return `<section class="paper card paper-${provider.tone}">
+      <p class="eyebrow">${escapeHtml(provider.label)}</p>
+      <h3>Assigned domains</h3>
+      ${list}
+    </section>`;
+  }).join("\n");
+
+  const content = `
+    <section class="panel paper paper-lavender">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">DNS registrars</p>
+          <h2>Provider Domains</h2>
+        </div>
+        <a class="button button-ghost" href="/admin">Back to dashboard</a>
+      </div>
+      <p class="lede">Assign each managed domain to the registrar/provider that hosts its DNS. Only assigned domains get a "Create A Record" button on the dashboard, and a domain can only be driven through the provider it is assigned to.</p>
+      ${error ? `<div class="empty-state">${escapeHtml(error)}</div>` : ""}
+      <form method="post" action="/admin/config/dns-domains" class="config-add-form">
+        <label>Domain <input name="domain" placeholder="example.com" required></label>
+        <label>Provider <select name="provider" required>${providerOptions}</select></label>
+        <button class="button">Add / assign domain</button>
+      </form>
+    </section>
+
+    <section class="form-grid config-provider-grid">
+      ${providerCards}
+    </section>`;
+
+  return renderAdminLayout("Config", "/admin/config", content);
+}
+
 function renderDeploymentsPage(deployments: any[]) {
   const content = `
     <section class="panel paper paper-rose">
@@ -359,61 +725,243 @@ function renderDeploymentsPage(deployments: any[]) {
   return renderAdminLayout("Deployments", "/admin/deployments", content);
 }
 
-function renderWebsitesPage(sites: SiteRow[], domains: any[], visitCounts: Record<string, number>) {
+const ACTIVITY_CATEGORIES = ["dns", "route", "domain", "deploy", "site", "database", "mail", "system"] as const;
+
+const ACTIVITY_CATEGORY_LABELS: Record<string, string> = {
+  dns: "DNS",
+  route: "Routing",
+  domain: "Domains",
+  deploy: "Deploys",
+  site: "Sites",
+  database: "Databases",
+  mail: "Mail",
+  system: "System",
+};
+
+function activityCategoryTone(category: string) {
+  switch (category) {
+    case "dns":
+      return "lavender";
+    case "route":
+      return "sky";
+    case "deploy":
+      return "rose";
+    case "domain":
+      return "mint";
+    default:
+      return "peach";
+  }
+}
+
+function renderLogsPage(entries: ActivityRow[], active?: string) {
+  const filters = [
+    `<a class="log-filter${active ? "" : " active"}" href="/admin/logs">All</a>`,
+    ...ACTIVITY_CATEGORIES.map(
+      (cat) =>
+        `<a class="log-filter${active === cat ? " active" : ""}" href="/admin/logs?category=${cat}">${escapeHtml(
+          ACTIVITY_CATEGORY_LABELS[cat],
+        )}</a>`,
+    ),
+  ].join("");
+
+  const body =
+    entries.length === 0
+      ? `<div class="empty-state">No activity recorded yet${active ? ` in "${escapeHtml(ACTIVITY_CATEGORY_LABELS[active] ?? active)}"` : ""}. DNS changes, route/path applies, deploys, and site actions show up here as they happen.</div>`
+      : `<ul class="log-list">${entries.map(renderLogItem).join("")}</ul>`;
+
+  const content = `
+    <section class="panel paper">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Audit trail</p>
+          <h2>Activity Logs</h2>
+        </div>
+        <button type="button" class="button button-soft" id="logs-refresh">Refresh</button>
+      </div>
+      <p class="lede">Everything Someting does on your behalf — DNS A-records, Caddy route &amp; path applies, deploys, and site lifecycle — newest first. Persisted in Postgres so it survives restarts. Container logs (<code>docker logs</code>) keep the raw lines too.</p>
+      <div class="log-filters">${filters}</div>
+      <div id="logs-body" data-endpoint="/admin/logs.json${active ? `?category=${active}` : ""}">${body}</div>
+    </section>
+    ${renderLogsScript()}`;
+
+  return renderAdminLayout("Logs", "/admin/logs", content);
+}
+
+function renderLogItem(entry: ActivityRow) {
+  const tone = activityCategoryTone(entry.category);
+  const statusClass = entry.status === "error" ? "bad" : entry.status === "info" ? "warn" : "good";
+  const duration = entry.duration_ms != null ? ` · ${entry.duration_ms} ms` : "";
+  const detail = entry.detail
+    ? `<details class="log-detail"><summary>Detail</summary><pre>${escapeHtml(entry.detail)}</pre></details>`
+    : "";
+  return `<li class="log-item">
+    <div class="log-head">
+      <span class="log-cat log-cat-${tone}">${escapeHtml(ACTIVITY_CATEGORY_LABELS[entry.category] ?? entry.category)}</span>
+      <span class="status-pill ${statusClass}">${escapeHtml(entry.status)}</span>
+      <strong class="log-action">${escapeHtml(entry.action)}</strong>
+      <span class="log-target">${escapeHtml(entry.target ?? "")}</span>
+      <time class="log-time">${escapeHtml(formatDate(entry.at))}${escapeHtml(duration)}</time>
+    </div>
+    ${detail}
+  </li>`;
+}
+
+function renderLogsScript() {
+  return `<script>
+  (function () {
+    var btn = document.getElementById("logs-refresh");
+    var bodyEl = document.getElementById("logs-body");
+    if (!btn || !bodyEl) return;
+
+    function esc(v) {
+      return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+    var labels = ${JSON.stringify(ACTIVITY_CATEGORY_LABELS)};
+    var tones = { dns: "lavender", route: "sky", deploy: "rose", domain: "mint" };
+    function tone(c) { return tones[c] || "peach"; }
+
+    function render(entries) {
+      if (!entries.length) return '<div class="empty-state">No activity recorded yet.</div>';
+      return '<ul class="log-list">' + entries.map(function (e) {
+        var statusClass = e.status === "error" ? "bad" : e.status === "info" ? "warn" : "good";
+        var dur = e.duration_ms != null ? " · " + e.duration_ms + " ms" : "";
+        var when = new Date(e.at).toLocaleString();
+        var detail = e.detail ? '<details class="log-detail"><summary>Detail</summary><pre>' + esc(e.detail) + '</pre></details>' : "";
+        return '<li class="log-item"><div class="log-head">'
+          + '<span class="log-cat log-cat-' + tone(e.category) + '">' + esc(labels[e.category] || e.category) + '</span>'
+          + '<span class="status-pill ' + statusClass + '">' + esc(e.status) + '</span>'
+          + '<strong class="log-action">' + esc(e.action) + '</strong>'
+          + '<span class="log-target">' + esc(e.target || "") + '</span>'
+          + '<time class="log-time">' + esc(when) + esc(dur) + '</time>'
+          + '</div>' + detail + '</li>';
+      }).join("") + '</ul>';
+    }
+
+    btn.addEventListener("click", async function () {
+      btn.disabled = true;
+      try {
+        var res = await fetch(bodyEl.dataset.endpoint, { headers: { Accept: "application/json" } });
+        var data = await res.json();
+        bodyEl.innerHTML = render(data.entries || []);
+      } catch (err) {
+        // leave existing content
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  })();
+  </script>`;
+}
+
+function renderVisitsChart(visits: WeeklyVisits | undefined) {
+  const series = visits?.weeks ?? [];
+  if (series.length === 0) {
+    return `<span class="site-visits-meta muted">no traffic data</span>`;
+  }
+  const max = Math.max(1, ...series.map((w) => w.count));
+  const barW = 9;
+  const gap = 4;
+  const h = 30;
+  const width = series.length * (barW + gap) - gap;
+
+  const bars = series
+    .map((w, i) => {
+      const bh = w.count === 0 ? 2 : Math.round((w.count / max) * (h - 3)) + 3;
+      const x = i * (barW + gap);
+      const y = h - bh;
+      const opacity = (0.35 + 0.65 * ((i + 1) / series.length)).toFixed(2);
+      const when = new Date(w.start).toLocaleDateString();
+      const label = `${w.count} visit${w.count === 1 ? "" : "s"} · week of ${when}`;
+      return `<rect x="${x}" y="${y}" width="${barW}" height="${bh}" rx="2" fill-opacity="${opacity}"><title>${escapeHtml(label)}</title></rect>`;
+    })
+    .join("");
+
+  return `<svg class="visits-chart" viewBox="0 0 ${width} ${h}" width="${width}" height="${h}" role="img" aria-label="Visits per week, last ${series.length} weeks">${bars}</svg>`;
+}
+
+function renderSiteCard(site: SiteRow, siteDomains: any[], visits: WeeklyVisits | undefined) {
+  const domainList = siteDomains.length > 0
+    ? siteDomains
+        .map((d) => `<a href="https://${escapeHtml(d.hostname)}" target="_blank">${escapeHtml(d.hostname)}${d.is_primary ? " ★" : ""}</a>`)
+        .join(" ")
+    : `<span class="muted">No domains</span>`;
+
+  const recent = visits?.recentTotal ?? 0;
+  const allTime = visits?.allTime ?? 0;
+
+  return `<article class="site-row paper paper-mint">
+    <div class="site-row-top">
+      <div class="site-row-id">
+        <h3>${escapeHtml(site.slug)}</h3>
+        <span class="status-pill ${statusTone(site.status)}">${escapeHtml(site.status)}</span>
+        <span class="runtime-tag">${escapeHtml(site.runtime)}</span>
+      </div>
+      <div class="site-visits">
+        ${renderVisitsChart(visits)}
+        <span class="site-visits-meta"><strong>${recent}</strong> in 10 wk · ${allTime} total</span>
+      </div>
+    </div>
+
+    <div class="site-meta-line">
+      <span class="site-meta-item"><span class="detail-label">Domains</span> ${domainList}</span>
+      <span class="site-meta-item"><span class="detail-label">Repo</span> <a href="${escapeHtml(site.repo_url.replace(".git", ""))}" target="_blank">${escapeHtml(site.repo_url)}</a> <small class="muted">(${escapeHtml(site.branch)}${site.repo_subdir ? ` · ${escapeHtml(site.repo_subdir)}/` : ""})</small></span>
+    </div>
+
+    <details class="site-domain-add">
+      <summary>+ Add domain</summary>
+      <form method="post" action="/admin/domains" class="inline-domain-form">
+        <input type="hidden" name="site_id" value="${site.id}">
+        <input name="hostname" placeholder="example.com" required>
+        <label class="check-row"><input type="checkbox" name="is_primary" value="true"> Primary</label>
+        <button class="button button-soft">Add domain</button>
+      </form>
+    </details>
+
+    <div class="action-bar">
+      <div class="action-group">
+        <span class="action-group-label">Deploy</span>
+        <div class="action-group-buttons">
+          <form method="post" action="/admin/sites/${site.id}/deploy"><button class="button">Redeploy</button></form>
+          <form method="post" action="/admin/sites/${site.id}/recreate"><button class="button button-soft">Recreate</button></form>
+          <form method="post" action="/admin/sites/${site.id}/restart"><button class="button button-soft">Restart</button></form>
+        </div>
+      </div>
+      <div class="action-group">
+        <span class="action-group-label">Routing</span>
+        <div class="action-group-buttons">
+          <form method="post" action="/admin/sites/${site.id}/apply-route"><button class="button button-soft">Apply route</button></form>
+          <form method="post" action="/admin/sites/${site.id}/apply-path-route"><button class="button button-soft">Path route</button></form>
+          <a class="button button-soft" href="/sites/${site.slug}/">Open path</a>
+        </div>
+      </div>
+      <div class="action-group">
+        <span class="action-group-label">Manage</span>
+        <div class="action-group-buttons">
+          <a class="button button-link" href="/admin/sites/${site.id}/edit">Edit</a>
+          <a class="button button-link" href="/admin/sites/${site.id}/env">Env</a>
+          <a class="button button-link" href="/admin/sites/${site.id}/storage">Storage</a>
+          <a class="button button-link" href="/admin/sites/${site.id}/deploy-auth">Deploy Auth</a>
+          <a class="button button-link" href="/admin/sites/${site.id}/exec">Terminal</a>
+          <a class="button button-link" href="/admin/sites/${site.id}/logs">Logs</a>
+        </div>
+      </div>
+      <div class="action-group action-group-danger">
+        <span class="action-group-label">Danger</span>
+        <div class="action-group-buttons">
+          <form method="post" action="/admin/sites/${site.id}/delete" onsubmit="return confirm('Permanently delete ${escapeHtml(site.slug)}? This destroys its container, storage, and database row.');"><button class="button button-danger">Delete</button></form>
+        </div>
+      </div>
+    </div>
+  </article>`;
+}
+
+function renderWebsitesPage(sites: SiteRow[], domains: any[], visits: Record<string, WeeklyVisits>) {
   const siteListHtml = sites.length === 0
     ? `<div class="empty-state">No sites yet. <a href="/admin/sites/new">Create your first site</a>.</div>`
     : `<div class="site-list">
-        ${sites.map((site) => {
-          const siteDomains = domains.filter(d => d.site_id === site.id);
-          const domainList = siteDomains.length > 0 
-            ? siteDomains.map(d => "<a href='https://" + escapeHtml(d.hostname) + "' target='_blank'>" + escapeHtml(d.hostname) + (d.is_primary ? " (Primary)" : "") + "</a>").join(", ")
-            : "None";
-          
-          return `<article class="site-row paper paper-mint">
-            <div class="site-row-header">
-              <h3>${escapeHtml(site.slug)}</h3>
-              <span class="status-pill ${statusTone(site.status)}">${escapeHtml(site.status)}</span>
-            </div>
-            <div class="site-row-details">
-              <div class="detail-group">
-                <span class="detail-label">Runtime</span>
-                <span class="detail-value runtime-tag">${escapeHtml(site.runtime)}</span>
-              </div>
-              <div class="detail-group">
-                <span class="detail-label">Domains</span>
-                <span class="detail-value">${domainList}</span>
-                <form method="post" action="/admin/domains" class="inline-domain-form">
-                  <input type="hidden" name="site_id" value="${site.id}">
-                  <input name="hostname" placeholder="example.com" required>
-                  <label class="check-row"><input type="checkbox" name="is_primary" value="true"> Primary</label>
-                  <button class="button button-soft">Add domain</button>
-                </form>
-              </div>
-              <div class="detail-group">
-                <span class="detail-label">Repository</span>
-                <span class="detail-value"><a href="${escapeHtml(site.repo_url.replace(".git", ""))}" target="_blank">${escapeHtml(site.repo_url)}</a> (${escapeHtml(site.branch)})</span>
-              </div>
-              <div class="detail-group">
-                <span class="detail-label">Visits</span>
-                <span class="detail-value"><strong>${visitCounts[site.slug] || 0}</strong> hits</span>
-              </div>
-            </div>
-            <div class="actions">
-              <a class="button button-link" href="/admin/sites/${site.id}/edit">Edit</a>
-              <form method="post" action="/admin/sites/${site.id}/deploy"><button class="button">Redeploy</button></form>
-              <form method="post" action="/admin/sites/${site.id}/recreate"><button class="button button-soft">Recreate</button></form>
-              <form method="post" action="/admin/sites/${site.id}/restart"><button class="button button-soft">Restart</button></form>
-              <form method="post" action="/admin/sites/${site.id}/apply-route"><button class="button button-soft">Apply route</button></form>
-              <form method="post" action="/admin/sites/${site.id}/apply-path-route"><button class="button button-soft">Path route</button></form>
-              <a class="button button-link" href="/sites/${site.slug}/">Open path</a>
-              <a class="button button-link" href="/admin/sites/${site.id}/deploy-auth">Deploy Auth</a>
-              <a class="button button-link" href="/admin/sites/${site.id}/env">Env</a>
-              <a class="button button-link" href="/admin/sites/${site.id}/storage">Storage</a>
-              <a class="button button-link" href="/admin/sites/${site.id}/exec">Terminal</a>
-              <a class="button button-link" href="/admin/sites/${site.id}/logs">Logs</a>
-            </div>
-          </article>`;
-        }).join("")}
+        ${sites
+          .map((site) => renderSiteCard(site, domains.filter((d) => d.site_id === site.id), visits[site.slug]))
+          .join("")}
       </div>`;
 
   const content = `
@@ -430,6 +978,180 @@ function renderWebsitesPage(sites: SiteRow[], domains: any[], visitCounts: Recor
   `;
 
   return renderAdminLayout("Websites", "/admin/websites", content);
+}
+
+function renderSiteDetailPage(
+  site: SiteRow,
+  siteDomains: any[],
+  visits: WeeklyVisits | undefined,
+  deployments: any[],
+  activity: ActivityRow[],
+  containerLogs: string,
+) {
+  const primary = siteDomains.find((d) => d.is_primary) ?? siteDomains[0];
+  const repoUrlClean = site.repo_url.replace(".git", "");
+
+  const detailCells = [
+    ["Status", `<span class="status-pill ${statusTone(site.status)}">${escapeHtml(site.status)}</span>`],
+    ["Runtime", `<span class="runtime-tag">${escapeHtml(site.runtime)}</span>`],
+    ["Slug", `<code>${escapeHtml(site.slug)}</code>`],
+    [
+      "Repository",
+      site.repo_url
+        ? `<a href="${escapeHtml(repoUrlClean)}" target="_blank">${escapeHtml(site.repo_url)}</a>`
+        : `<span class="muted">none</span>`,
+    ],
+    ["Branch", `<code>${escapeHtml(site.branch)}</code>`],
+    ["Subdirectory", site.repo_subdir ? `<code>${escapeHtml(site.repo_subdir)}/</code>` : `<span class="muted">repo root</span>`],
+    ["Healthcheck", `<code>${escapeHtml(site.healthcheck_path ?? "/")}</code>`],
+    ["Build command", site.build_command ? `<code>${escapeHtml(site.build_command)}</code>` : `<span class="muted">none</span>`],
+    ["Start command", site.start_command ? `<code>${escapeHtml(site.start_command)}</code>` : `<span class="muted">none</span>`],
+  ]
+    .map(
+      ([label, value]) => `<div class="detail-cell">
+        <span class="detail-label">${escapeHtml(label)}</span>
+        <div class="detail-value">${value}</div>
+      </div>`,
+    )
+    .join("");
+
+  const domainsHtml = siteDomains.length > 0
+    ? `<ul class="stack-list">${siteDomains
+        .map(
+          (d) => `<li>
+            <span><a href="https://${escapeHtml(d.hostname)}" target="_blank">${escapeHtml(d.hostname)}</a>${d.is_primary ? ` <span class="status-pill good">primary</span>` : ""}</span>
+          </li>`,
+        )
+        .join("")}</ul>`
+    : `<div class="mini-empty">No domains configured yet.</div>`;
+
+  const recent = visits?.recentTotal ?? 0;
+  const allTime = visits?.allTime ?? 0;
+
+  const activityHtml = activity.length > 0
+    ? `<ul class="log-list">${activity.map(renderLogItem).join("")}</ul>`
+    : `<div class="mini-empty">No activity recorded for this site yet.</div>`;
+
+  const deploymentsHtml = deployments.length > 0
+    ? `<ul class="stack-list">${deployments
+        .map(
+          (d) => `<li>
+            <span><span class="status-pill ${statusTone(d.status)}">${escapeHtml(d.status)}</span> <a href="/admin/deployments/${d.id}/logs">View logs</a></span>
+            <small>${escapeHtml(formatDate(d.started_at))}</small>
+          </li>`,
+        )
+        .join("")}</ul>`
+    : `<div class="mini-empty">No deployments have run for this site yet.</div>`;
+
+  const content = `
+    <section class="panel paper paper-mint site-detail-head">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Site detail</p>
+          <h2>${escapeHtml(site.name || site.slug)}</h2>
+          <p class="lede">${primary ? `<a href="https://${escapeHtml(primary.hostname)}" target="_blank">${escapeHtml(primary.hostname)}</a>` : `<a href="/sites/${escapeHtml(site.slug)}/">/sites/${escapeHtml(site.slug)}/</a>`}</p>
+        </div>
+        <div class="detail-head-actions">
+          <a class="button button-ghost" href="/admin">Back to dashboard</a>
+          <a class="button" href="/admin/sites/${site.id}/edit">Edit</a>
+        </div>
+      </div>
+
+      <div class="action-bar">
+        <div class="action-group">
+          <span class="action-group-label">Deploy</span>
+          <div class="action-group-buttons">
+            <form method="post" action="/admin/sites/${site.id}/deploy"><button class="button">Redeploy</button></form>
+            <form method="post" action="/admin/sites/${site.id}/recreate"><button class="button button-soft">Recreate</button></form>
+            <form method="post" action="/admin/sites/${site.id}/restart"><button class="button button-soft">Restart</button></form>
+          </div>
+        </div>
+        <div class="action-group">
+          <span class="action-group-label">Routing</span>
+          <div class="action-group-buttons">
+            <form method="post" action="/admin/sites/${site.id}/apply-route"><button class="button button-soft">Apply route</button></form>
+            <form method="post" action="/admin/sites/${site.id}/apply-path-route"><button class="button button-soft">Path route</button></form>
+            <a class="button button-soft" href="/sites/${site.slug}/">Open path</a>
+          </div>
+        </div>
+        <div class="action-group">
+          <span class="action-group-label">Manage</span>
+          <div class="action-group-buttons">
+            <a class="button button-link" href="/admin/sites/${site.id}/env">Env</a>
+            <a class="button button-link" href="/admin/sites/${site.id}/storage">Storage</a>
+            <a class="button button-link" href="/admin/sites/${site.id}/deploy-auth">Deploy Auth</a>
+            <a class="button button-link" href="/admin/sites/${site.id}/exec">Terminal</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="detail-columns">
+      <section class="panel paper">
+        <div class="section-heading"><div><p class="eyebrow">Configuration</p><h2>Overview</h2></div></div>
+        <div class="detail-grid">${detailCells}</div>
+      </section>
+
+      <section class="panel paper paper-lavender">
+        <div class="section-heading"><div><p class="eyebrow">Traffic</p><h2>Visits</h2></div></div>
+        <div class="detail-visits">
+          ${renderVisitsChart(visits)}
+          <p class="site-visits-meta"><strong>${recent}</strong> in last 10 weeks · ${allTime} all-time</p>
+        </div>
+        <h3>Domains</h3>
+        ${domainsHtml}
+        <details class="site-domain-add">
+          <summary>+ Add domain</summary>
+          <form method="post" action="/admin/domains" class="inline-domain-form">
+            <input type="hidden" name="site_id" value="${site.id}">
+            <input name="hostname" placeholder="example.com" required>
+            <label class="check-row"><input type="checkbox" name="is_primary" value="true"> Primary</label>
+            <button class="button button-soft">Add domain</button>
+          </form>
+        </details>
+      </section>
+    </section>
+
+    <section class="panel paper">
+      <div class="section-heading">
+        <div><p class="eyebrow">Runtime</p><h2>Container Logs</h2></div>
+        <button type="button" class="button button-soft" id="site-logs-refresh">Refresh</button>
+      </div>
+      <p class="lede">Last 200 lines from <code>docker logs site-${escapeHtml(site.slug)}</code>.</p>
+      <pre class="logbox" id="site-logs-box" data-endpoint="/admin/sites/${site.id}/logs">${escapeHtml(containerLogs || "No logs returned.")}</pre>
+    </section>
+
+    <section class="detail-columns">
+      <section class="panel paper">
+        <div class="section-heading"><div><p class="eyebrow">Audit</p><h2>Recent Activity</h2></div></div>
+        ${activityHtml}
+      </section>
+      <section class="panel paper">
+        <div class="section-heading"><div><p class="eyebrow">History</p><h2>Deployments</h2></div></div>
+        ${deploymentsHtml}
+      </section>
+    </section>
+
+    <script>
+    (function () {
+      var btn = document.getElementById("site-logs-refresh");
+      var box = document.getElementById("site-logs-box");
+      if (!btn || !box) return;
+      btn.addEventListener("click", async function () {
+        btn.disabled = true;
+        try {
+          var res = await fetch(box.dataset.endpoint, { headers: { Accept: "text/plain" } });
+          box.textContent = await res.text();
+        } catch (err) {
+          // keep current content
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    })();
+    </script>`;
+
+  return renderAdminLayout(site.name || site.slug, `/admin/sites/${site.id}/detail`, content);
 }
 
 function runtimeSelectOptions(selected: string) {
@@ -455,15 +1177,15 @@ function renderSiteEditorPage(site: SiteRow | null, currentPath: string) {
     ? `<label>Runtime
           <select name="runtime" required>${runtimeSelectOptions("html")}</select>
         </label>`
-    : `<div class="readonly-block">
-        <span class="detail-label">Runtime</span>
-        <div><span class="runtime-tag">${escapeHtml(site.runtime)}</span></div>
-        <small>Set at provision time.</small>
-      </div>`;
+    : `<label>Runtime
+          <select name="runtime" required>${runtimeSelectOptions(site.runtime)}</select>
+          <small class="hint">Swaps the Dockerfile/compose template. Redeploy or recreate the site afterwards to rebuild the container with the new runtime.</small>
+        </label>`;
 
   const name = isCreate ? "" : escapeHtml(site.name);
   const repo = isCreate ? "" : escapeHtml(site.repo_url);
   const branch = isCreate ? "main" : escapeHtml(site.branch);
+  const repoSubdir = isCreate ? "" : escapeHtml(site.repo_subdir ?? "");
   const health = isCreate ? "/" : escapeHtml(site.healthcheck_path ?? "/");
   const build = isCreate ? "" : escapeHtml(site.build_command ?? "");
   const start = isCreate ? "" : escapeHtml(site.start_command ?? "");
@@ -485,8 +1207,12 @@ function renderSiteEditorPage(site: SiteRow | null, currentPath: string) {
         <label>Repository URL <input name="repo_url" placeholder="https://github.com/user/repo.git or upload://my-site" value="${repo}" required></label>
         <div class="field-pair">
           <label>Branch <input name="branch" placeholder="main" value="${branch}" required></label>
-          <label>Healthcheck path <input name="healthcheck_path" value="${health}" placeholder="/"></label>
+          <label>Repository subdirectory
+            <input name="repo_subdir" placeholder="frontend (leave empty for repo root)" value="${repoSubdir}">
+            <small class="hint">For monorepos: only this folder is built and deployed. Use the same repo URL on multiple sites with different subdirectories.</small>
+          </label>
         </div>
+        <label>Healthcheck path <input name="healthcheck_path" value="${health}" placeholder="/"></label>
         <label>Build command <input name="build_command" placeholder="npm run build" value="${build}"></label>
         <label>Start command <input name="start_command" placeholder="npm start" value="${start}"></label>
         <div class="actions">
@@ -494,6 +1220,17 @@ function renderSiteEditorPage(site: SiteRow | null, currentPath: string) {
           <a class="button button-soft" href="/admin/websites">Cancel</a>
         </div>
       </form>
+      ${isCreate ? "" : `
+      <section class="danger-zone">
+        <div>
+          <p class="eyebrow">Danger zone</p>
+          <h3>Delete site</h3>
+          <p class="lede">Stops the container, removes its Caddy route, deletes <code>${escapeHtml(site!.slug)}</code>'s on-disk directory (including persistent /data storage) and its database row. This cannot be undone.</p>
+        </div>
+        <form method="post" action="/admin/sites/${site!.id}/delete" onsubmit="return confirm('Permanently delete ${escapeHtml(site!.slug)}? This destroys its container, storage, and database row.');">
+          <button type="submit" class="button button-danger">Delete site</button>
+        </form>
+      </section>`}
     </section>
   `;
 
@@ -521,6 +1258,202 @@ function renderDomainList(domains: any[]) {
       </li>`,
     )
     .join("")}</ul>`;
+}
+
+function renderDnsLogPanel() {
+  const attempts = listDnsAttempts();
+  return `<section class="panel paper paper-lavender">
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">DNS automation</p>
+        <h2>Recent A-record attempts</h2>
+      </div>
+      <button type="button" class="button button-soft" id="dns-log-refresh">Refresh</button>
+    </div>
+    <p class="dns-record-hint">Last ${attempts.length} attempts since the control-plane started. Failures keep the full API response so you can see what went wrong. Also written to container logs (<code>docker logs</code>).</p>
+    <div id="dns-log-body">${renderDnsLogBody(attempts)}</div>
+  </section>`;
+}
+
+function renderDnsLogBody(attempts: DnsAttempt[]) {
+  if (attempts.length === 0) {
+    return `<div class="mini-empty">No DNS attempts yet.</div>`;
+  }
+  return `<ul class="dns-log-list">${attempts
+    .map((attempt) => renderDnsLogItem(attempt))
+    .join("")}</ul>`;
+}
+
+function renderDnsLogItem(attempt: DnsAttempt) {
+  const tone = attempt.ok ? "good" : "bad";
+  const label = attempt.ok ? "OK" : "FAIL";
+  const errorBlock = attempt.error
+    ? `<details class="dns-log-error"><summary>Error detail</summary><pre>${escapeHtml(attempt.error)}</pre></details>`
+    : "";
+  return `<li class="dns-log-item">
+    <div class="dns-log-head">
+      <span class="status-pill ${tone}">${escapeHtml(label)}</span>
+      <strong>${escapeHtml(attempt.hostname || "(no hostname)")}</strong>
+      <span class="dns-log-provider">${escapeHtml(attempt.provider)}</span>
+      <span class="dns-log-meta">${escapeHtml(attempt.ip ?? "—")} · TTL ${escapeHtml(attempt.ttl ?? "—")} · ${attempt.durationMs} ms</span>
+      <time class="dns-log-time">${escapeHtml(formatDate(attempt.at))}</time>
+    </div>
+    ${errorBlock}
+  </li>`;
+}
+
+function renderDnsCard(opts: {
+  eyebrow: string;
+  title: string;
+  hint: string;
+  domains: readonly string[];
+  endpoint: string;
+  tone: "mint" | "peach" | "lavender" | "sky" | "rose";
+}) {
+  const rows = opts.domains
+    .map(
+      (domain) => `<form class="dns-record-form" data-domain="${escapeHtml(domain)}" data-endpoint="${escapeHtml(opts.endpoint)}">
+        <div class="dns-record-row">
+          <input name="subdomain" placeholder="app" pattern="[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*" required>
+          <span class="dns-record-suffix">.${escapeHtml(domain)}</span>
+          <button class="button button-soft" type="submit">Create A</button>
+        </div>
+        <div class="dns-record-status" aria-live="polite"></div>
+        <details class="dns-record-detail" hidden><summary>Error detail</summary><pre></pre></details>
+      </form>`,
+    )
+    .join("");
+
+  const body = opts.domains.length
+    ? rows
+    : `<div class="mini-empty">No domains assigned. Add one on the <a href="/admin/config">Config</a> page.</div>`;
+
+  return `<section class="paper card paper-${opts.tone}">
+    <p class="eyebrow">${escapeHtml(opts.eyebrow)}</p>
+    <h2>${escapeHtml(opts.title)}</h2>
+    <p class="dns-record-hint">${opts.hint}</p>
+    ${body}
+  </section>`;
+}
+
+function renderDnsAutomationScript() {
+  return `<script>
+  (function () {
+    if (window.__dnsRecordFormsBound) return;
+    window.__dnsRecordFormsBound = true;
+
+    function setDetail(form, message) {
+      var detail = form.querySelector(".dns-record-detail");
+      if (!detail) return;
+      var pre = detail.querySelector("pre");
+      if (message) {
+        pre.textContent = message;
+        detail.hidden = false;
+      } else {
+        pre.textContent = "";
+        detail.hidden = true;
+        detail.open = false;
+      }
+    }
+
+    async function refreshLogPanel() {
+      var body = document.getElementById("dns-log-body");
+      if (!body) return;
+      try {
+        var res = await fetch("/admin/dns/log.json", { headers: { Accept: "application/json" } });
+        if (!res.ok) return;
+        var data = await res.json();
+        body.innerHTML = renderAttempts(data.attempts || []);
+      } catch (err) {
+        // ignore — panel just stays stale
+      }
+    }
+
+    function renderAttempts(attempts) {
+      if (!attempts.length) {
+        return '<div class="mini-empty">No DNS attempts yet.</div>';
+      }
+      return '<ul class="dns-log-list">' + attempts.map(renderAttempt).join("") + '</ul>';
+    }
+
+    function escapeHtml(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function renderAttempt(a) {
+      var tone = a.ok ? "good" : "bad";
+      var label = a.ok ? "OK" : "FAIL";
+      var when = a.at ? new Date(a.at).toLocaleString() : "";
+      var detail = a.error
+        ? '<details class="dns-log-error"><summary>Error detail</summary><pre>' + escapeHtml(a.error) + '</pre></details>'
+        : '';
+      return '<li class="dns-log-item">'
+        + '<div class="dns-log-head">'
+        + '<span class="status-pill ' + tone + '">' + label + '</span>'
+        + '<strong>' + escapeHtml(a.hostname || "(no hostname)") + '</strong>'
+        + '<span class="dns-log-provider">' + escapeHtml(a.provider) + '</span>'
+        + '<span class="dns-log-meta">' + escapeHtml(a.ip || "—") + ' · TTL ' + escapeHtml(a.ttl || "—") + ' · ' + (a.durationMs || 0) + ' ms</span>'
+        + '<time class="dns-log-time">' + escapeHtml(when) + '</time>'
+        + '</div>'
+        + detail
+        + '</li>';
+    }
+
+    document.querySelectorAll(".dns-record-form").forEach(function (form) {
+      form.addEventListener("submit", async function (event) {
+        event.preventDefault();
+        var domain = form.dataset.domain;
+        var endpoint = form.dataset.endpoint;
+        var input = form.querySelector('[name="subdomain"]');
+        var subdomain = (input.value || "").trim();
+        var status = form.querySelector(".dns-record-status");
+        var button = form.querySelector("button");
+        if (!subdomain) { return; }
+        status.className = "dns-record-status pending";
+        status.textContent = "Creating " + subdomain + "." + domain + "…";
+        setDetail(form, "");
+        button.disabled = true;
+        try {
+          var body = new URLSearchParams({ domain: domain, subdomain: subdomain });
+          var res = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: body,
+          });
+          var data;
+          var raw = await res.text();
+          try { data = JSON.parse(raw); } catch (e) { data = { ok: false, error: raw }; }
+          if (res.ok && data && data.ok) {
+            status.className = "dns-record-status ok";
+            status.textContent = "Created " + data.hostname + " → " + data.ip + " (TTL " + data.ttl + ")";
+            input.value = "";
+          } else {
+            var message = (data && data.error) || ("HTTP " + res.status + " " + raw);
+            status.className = "dns-record-status err";
+            // Short summary in the status line; full text in <details>.
+            var firstLine = String(message).split("\\n")[0];
+            status.textContent = firstLine.length > 200 ? firstLine.slice(0, 200) + "…" : firstLine;
+            setDetail(form, message);
+          }
+        } catch (err) {
+          var message = (err && (err.stack || err.message)) || String(err);
+          status.className = "dns-record-status err";
+          status.textContent = (err && err.message) || String(err);
+          setDetail(form, message);
+        } finally {
+          button.disabled = false;
+          refreshLogPanel();
+        }
+      });
+    });
+
+    var refreshBtn = document.getElementById("dns-log-refresh");
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", refreshLogPanel);
+    }
+  })();
+  </script>`;
 }
 
 function renderMailNotes(mailNotes: any[]) {
@@ -704,11 +1637,32 @@ function renderAdminStyles() {
     .site-card-top { align-items: start; display: flex; gap: 1rem; justify-content: space-between; }
     .site-card h3 { font-size: 1.7rem; letter-spacing: -.06em; margin: .45rem 0 .1rem; overflow-wrap: anywhere; }
     .site-card p { color: var(--muted); margin-bottom: 0; }
-    .site-list { display: grid; gap: 1rem; }
-    .site-row { padding: 1.5rem; }
-    .site-row-header { display: flex; justify-content: space-between; align-items: start; border-bottom: 2px dashed rgba(38, 50, 56, 0.15); padding-bottom: 1rem; margin-bottom: 1.25rem; }
-    .site-row-header h3 { margin: 0; font-size: 1.8rem; letter-spacing: -.05em; }
-    .site-row-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1.25rem; margin-bottom: 1.5rem; }
+    .site-list { display: grid; gap: .85rem; }
+    .site-row { padding: 1rem 1.15rem; }
+    .muted { color: var(--muted); }
+    .site-row-top { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+    .site-row-id { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+    .site-row-id h3 { margin: 0; font-size: 1.35rem; letter-spacing: -.04em; }
+    .site-visits { display: flex; align-items: center; gap: .55rem; }
+    .visits-chart { display: block; overflow: visible; }
+    .visits-chart rect { fill: var(--ink); }
+    .site-visits-meta { color: var(--muted); font-size: .76rem; white-space: nowrap; }
+    .site-visits-meta strong { color: var(--ink); }
+    .site-meta-line { display: flex; flex-wrap: wrap; gap: .35rem 1.5rem; margin: .7rem 0 .15rem; font-size: .88rem; }
+    .site-meta-item { overflow-wrap: anywhere; }
+    .site-meta-item .detail-label { display: inline; margin-right: .3rem; }
+    .site-meta-item a { text-decoration: underline; text-decoration-color: rgba(38, 50, 56, 0.3); text-underline-offset: 2px; }
+    .site-meta-item a:hover { text-decoration-color: var(--ink); }
+    .site-domain-add { margin: .35rem 0 .75rem; }
+    .site-domain-add > summary { cursor: pointer; color: var(--muted); font-size: .8rem; font-weight: 800; width: max-content; }
+    .site-domain-add[open] > summary { margin-bottom: .5rem; }
+    .action-bar { display: flex; flex-wrap: wrap; gap: .5rem .9rem; border-top: 2px dashed rgba(38, 50, 56, 0.15); padding-top: .8rem; }
+    .action-group { display: grid; gap: .3rem; }
+    .action-group-label { font-size: .65rem; font-weight: 900; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+    .action-group-buttons { display: flex; flex-wrap: wrap; gap: .35rem; }
+    .action-group-buttons form { margin: 0; }
+    .action-group-buttons .button { min-height: 2.1rem; padding: .35rem .7rem; font-size: .8rem; box-shadow: 2px 3px 0 rgba(38, 50, 56, .15); }
+    .action-group-danger { margin-left: auto; }
     .inline-domain-form { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; margin-top: .5rem; }
     .inline-domain-form input[name="hostname"] { flex: 1 1 140px; min-height: 2.2rem; padding: .35rem .55rem; font-size: .85rem; }
     .inline-domain-form .check-row { font-size: .7rem; }
@@ -724,6 +1678,30 @@ function renderAdminStyles() {
     .status-pill.warn { background: #ffe6a7; }
     .status-pill.bad { background: #ffb6c7; }
     .status-pill.neutral { background: #dbeafe; }
+    .status-dot { border: 2px solid var(--line); border-radius: 999px; display: inline-block; flex: 0 0 auto; height: 14px; width: 14px; }
+    .status-dot.good { background: #5fd08a; }
+    .status-dot.warn { background: #ffce5c; }
+    .status-dot.bad { background: #ff7b9c; }
+    .status-dot.neutral { background: #9ec5ff; }
+
+    /* Dashboard Sites list */
+    .dash-site-list { display: grid; gap: .6rem; list-style: none; margin: 0; padding: 0; }
+    .dash-site { align-items: center; background: rgba(255,255,255,.6); border: 2px solid rgba(38,50,56,.5); border-radius: 16px 14px 18px 13px; display: flex; flex-wrap: wrap; gap: .75rem 1rem; justify-content: space-between; padding: .7rem .9rem; }
+    .dash-site-main { align-items: center; display: flex; gap: .65rem; min-width: 180px; }
+    .dash-site-id { display: flex; flex-direction: column; line-height: 1.25; }
+    .dash-site-id strong { font-size: 1.02rem; letter-spacing: -.02em; }
+    .dash-site-mid { align-items: center; display: flex; flex: 1 1 auto; flex-wrap: wrap; gap: .55rem; justify-content: flex-end; }
+    .dash-site-domain { font-weight: 700; overflow-wrap: anywhere; }
+    .dash-site-actions { flex: 0 0 auto; }
+
+    /* Site detail page */
+    .detail-head-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+    .detail-columns { display: grid; gap: 1.1rem; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); margin-top: 1.1rem; }
+    .detail-grid { display: grid; gap: .85rem 1.2rem; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+    .detail-cell { display: flex; flex-direction: column; gap: .3rem; min-width: 0; }
+    .detail-cell code { background: rgba(38,50,56,.08); border-radius: 6px; overflow-wrap: anywhere; padding: 0 .3rem; }
+    .detail-visits { align-items: center; display: flex; flex-wrap: wrap; gap: .6rem 1rem; margin-bottom: .4rem; }
+    .logbox { background: #1f2933; border-radius: 14px; color: #f8fafc; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; margin: 0; max-height: 460px; overflow: auto; padding: 1rem; white-space: pre-wrap; word-break: break-word; }
     .meta-list { display: grid; gap: .75rem; margin: 0; }
     .meta-list div { min-width: 0; }
     .meta-list dt { color: var(--muted); font-size: .72rem; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; }
@@ -748,6 +1726,28 @@ function renderAdminStyles() {
     .button:hover { transform: translateY(-1px) rotate(-.4deg); }
     .button-soft, .button-ghost { background: #fffaf0; color: var(--ink); }
     .button-link { background: transparent; box-shadow: none; color: var(--ink); }
+    .button-danger { background: #c0392b; color: #fffaf0; }
+    .button-danger:hover { background: #962d22; }
+    .danger-zone {
+      margin-top: 2rem;
+      padding: 1.25rem;
+      border: 2px dashed #c0392b;
+      border-radius: 22px 18px 24px 16px;
+      background: rgba(255, 220, 220, 0.35);
+      display: grid;
+      gap: 1rem;
+    }
+    .danger-zone h3 { color: #962d22; margin-bottom: .3rem; }
+    .danger-zone .eyebrow { color: #962d22; }
+    .hint {
+      display: block;
+      margin-top: .35rem;
+      color: var(--muted);
+      font-weight: 500;
+      font-size: .78rem;
+      letter-spacing: normal;
+      text-transform: none;
+    }
     .form-grid { align-items: start; grid-template-columns: 1.2fr .9fr .9fr; }
     .field-pair { display: grid; gap: .8rem; grid-template-columns: 1fr 1fr; }
     .check-row { align-items: center; display: flex; flex-direction: row; gap: .65rem; text-transform: none; }
@@ -764,6 +1764,62 @@ function renderAdminStyles() {
     .empty-state, .mini-empty { background: rgba(255, 255, 255, .58); border: 2px dashed rgba(38, 50, 56, .42); border-radius: 20px; color: var(--muted); padding: 1rem; }
     .site-editor-shell { max-width: 720px; margin: 0 auto 2rem auto; }
     .site-editor-shell form > .actions { margin-top: .75rem; }
+    .log-filters { display: flex; flex-wrap: wrap; gap: .45rem; margin: 0 0 1.2rem; }
+    .log-filter { background: rgba(255,255,255,.6); border: 2px solid rgba(38,50,56,.45); border-radius: 999px; color: var(--ink); font-size: .78rem; font-weight: 800; padding: .3rem .75rem; text-decoration: none; }
+    .log-filter:hover { background: #fffaf0; }
+    .log-filter.active { background: var(--ink); color: #fffaf0; }
+    .log-list { display: grid; gap: .55rem; list-style: none; margin: 0; padding: 0; }
+    .log-item { background: rgba(255,255,255,.62); border: 2px solid rgba(38,50,56,.5); border-radius: 16px 14px 18px 13px; padding: .7rem .85rem; }
+    .log-head { align-items: center; display: flex; flex-wrap: wrap; gap: .55rem; }
+    .log-cat { border: 2px solid var(--line); border-radius: 999px; font-size: .68rem; font-weight: 900; letter-spacing: .06em; padding: .15rem .5rem; text-transform: uppercase; }
+    .log-cat-lavender { background: var(--lavender); }
+    .log-cat-sky { background: var(--sky); }
+    .log-cat-rose { background: var(--rose); }
+    .log-cat-mint { background: var(--mint); }
+    .log-cat-peach { background: var(--peach); }
+    .log-action { font-size: 1rem; letter-spacing: -.02em; }
+    .log-target { color: var(--muted); font-weight: 700; overflow-wrap: anywhere; }
+    .log-time { color: var(--muted); font-size: .8rem; margin-left: auto; white-space: nowrap; }
+    .log-detail { margin-top: .5rem; }
+    .log-detail summary { color: var(--muted); cursor: pointer; font-size: .8rem; font-weight: 800; }
+    .log-detail pre { background: #1f2933; border-radius: 12px; color: #f8fafc; font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; margin: .5rem 0 0; max-height: 320px; overflow: auto; padding: .8rem; white-space: pre-wrap; }
+    .dns-record-hint { color: var(--muted); font-size: .85rem; margin-bottom: .9rem; }
+    .dns-record-hint code { background: rgba(38,50,56,.08); border-radius: 6px; padding: 0 .3rem; }
+    .dns-record-form { display: grid; gap: .35rem; margin-bottom: .9rem; }
+    .dns-record-row { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
+    .dns-record-row input[name="subdomain"] { flex: 1 1 110px; min-height: 2.2rem; padding: .35rem .55rem; font-size: .85rem; }
+    .dns-record-suffix { color: var(--muted); font-weight: 700; font-size: .85rem; }
+    .dns-record-row .button { min-height: 2.2rem; padding: .35rem .7rem; font-size: .8rem; }
+    .dns-record-status { font-size: .8rem; min-height: 1em; overflow-wrap: anywhere; }
+    .dns-record-status.pending { color: var(--muted); }
+    .dns-record-status.ok { color: #1e7a3a; font-weight: 700; }
+    .dns-record-status.err { color: #962d22; font-weight: 700; }
+    .dns-record-detail summary { cursor: pointer; color: #962d22; font-size: .75rem; font-weight: 700; }
+    .dns-record-detail pre {
+      background: #1f2933; color: #f8fafc; border-radius: 12px; margin: .35rem 0 0;
+      padding: .6rem .75rem; max-height: 14rem; overflow: auto; white-space: pre-wrap; word-break: break-word;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+    .dns-log-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .55rem; }
+    .dns-log-item { background: rgba(255, 255, 255, .58); border: 1px dashed rgba(38, 50, 56, .38); border-radius: 16px; padding: .65rem .8rem; }
+    .dns-log-head { display: flex; flex-wrap: wrap; align-items: center; gap: .55rem; }
+    .dns-log-head strong { font-weight: 800; }
+    .dns-log-provider { background: var(--butter); border: 2px solid var(--line); border-radius: 999px; font-size: .68rem; font-weight: 900; letter-spacing: .08em; padding: .12rem .5rem; text-transform: uppercase; }
+    .dns-log-meta { color: var(--muted); font-size: .8rem; }
+    .dns-log-time { color: var(--muted); font-size: .75rem; margin-left: auto; }
+    .dns-log-error summary { cursor: pointer; color: #962d22; font-size: .78rem; font-weight: 700; margin-top: .35rem; }
+    .dns-log-error pre {
+      background: #1f2933; color: #f8fafc; border-radius: 12px; margin: .35rem 0 0;
+      padding: .6rem .75rem; max-height: 18rem; overflow: auto; white-space: pre-wrap; word-break: break-word;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+    .config-add-form { grid-template-columns: 2fr 1fr auto; align-items: end; gap: .8rem; }
+    .config-add-form .button { min-height: 2.85rem; }
+    .config-provider-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+    .config-domain-row { flex-direction: row !important; align-items: center; justify-content: space-between; gap: 1rem; }
+    .config-domain-row form { margin: 0; }
+    .config-domain-row .button { min-height: 2rem; padding: .3rem .7rem; font-size: .78rem; }
+    @media (max-width: 640px) { .config-add-form { grid-template-columns: 1fr; } }
     .readonly-block { margin-bottom: 1.1rem; }
     .readonly-block .detail-value { font-weight: 800; }
     .readonly-block small { color: var(--muted); display: block; margin-top: .38rem; font-weight: 500; font-size: .82rem; letter-spacing: normal; text-transform: none; }

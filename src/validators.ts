@@ -2,22 +2,35 @@ import { z } from "zod";
 
 export const runtimeSchema = z.enum(["php", "node", "python", "static", "html"]);
 
+/** Relative path inside the cloned repo used as the Docker build context (monorepos). */
+export const repoSubdirSchema = z
+  .string()
+  .default("")
+  .refine((value) => value === "" || (!value.startsWith("/") && !value.includes("..")), {
+    message: "Repository subdirectory must be a relative path without .. segments",
+  });
+
 export const siteInputSchema = z.object({
   slug: z.string().regex(/^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/),
   name: z.string().min(1),
   runtime: runtimeSchema,
   repo_url: z.string().regex(/^(https:\/\/|git@|ssh:\/\/|upload:\/\/).+/),
   branch: z.string().min(1).default("main"),
+  repo_subdir: repoSubdirSchema,
   build_command: z.string().optional().nullable(),
   start_command: z.string().optional().nullable(),
   healthcheck_path: z.string().startsWith("/").default("/"),
 });
 
-/** DB metadata only; slug/runtime are fixed after provision (changing them needs different tooling). */
+/** DB metadata only; slug is fixed after provision. Runtime can be changed but
+ *  requires the on-disk template files (Dockerfile/compose.yaml) to be swapped
+ *  out in lockstep, so platform.changeSiteRuntime handles that side effect. */
 export const siteMetadataUpdateSchema = z.object({
   name: z.string().min(1),
+  runtime: runtimeSchema.optional(),
   repo_url: z.string().regex(/^(https:\/\/|git@|ssh:\/\/|upload:\/\/).+/),
   branch: z.string().min(1),
+  repo_subdir: repoSubdirSchema,
   build_command: z.string().optional().nullable(),
   start_command: z.string().optional().nullable(),
   healthcheck_path: z.string().startsWith("/").default("/"),

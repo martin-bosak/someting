@@ -110,6 +110,21 @@
         "panel": "new"
       },
       "detail": "Interactive SSH via deploy/someting.cmd. Edit that file for host or key."
+    },
+    {
+      "label": "Someting: Backup platform to local _BACKUP",
+      "type": "shell",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File deploy/backup-platform.ps1",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true
+      },
+      "detail": "Dumps Postgres (via SSH tunnel), deployed site code + Caddy config, and each site's mounted shared/ volume into _BACKUP/<timestamp>/."
     }
   ]
 }

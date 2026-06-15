@@ -17,8 +17,8 @@ Inspection
   env <slug>                              Read site .env
 
 Lifecycle
-  create <slug> --name N --runtime R --repo URL [--branch B] [--build CMD] [--start CMD] [--health PATH]
-  update <slug> [--name N] [--repo URL] [--branch B] [--build CMD] [--start CMD] [--health PATH]
+  create <slug> --name N --runtime R --repo URL [--branch B] [--subdir PATH] [--build CMD] [--start CMD] [--health PATH]
+  update <slug> [--name N] [--repo URL] [--branch B] [--subdir PATH] [--build CMD] [--start CMD] [--health PATH]
   deploy <slug>                           Pull repo, build, restart
   recreate <slug>                         Recreate container without rebuilding image (picks up .env)
   restart <slug>                          Restart container (does not pick up .env changes)
@@ -122,6 +122,7 @@ async function main() {
       runtime: { type: "string" },
       repo: { type: "string" },
       branch: { type: "string" },
+      subdir: { type: "string" },
       build: { type: "string" },
       start: { type: "string" },
       health: { type: "string" },
@@ -179,6 +180,7 @@ async function dispatch(
         runtime: requireFlag(values, "runtime", "php|node|python|static|html"),
         repo_url: requireFlag(values, "repo", "https://... or upload://..."),
         branch: optionalFlag(values, "branch") ?? "main",
+        repo_subdir: optionalFlag(values, "subdir") ?? "",
         healthcheck_path: optionalFlag(values, "health") ?? "/",
       };
       const build = optionalFlag(values, "build");
@@ -195,6 +197,7 @@ async function dispatch(
         ["name", "name"],
         ["repo", "repo_url"],
         ["branch", "branch"],
+        ["subdir", "repo_subdir"],
         ["build", "build_command"],
         ["start", "start_command"],
         ["health", "healthcheck_path"],
@@ -204,7 +207,7 @@ async function dispatch(
         if (value !== undefined) args[key] = value;
       }
       if (Object.keys(args).length === 1) {
-        throw new Error("update needs at least one of --name --repo --branch --build --start --health");
+        throw new Error("update needs at least one of --name --repo --branch --subdir --build --start --health");
       }
       return callTool(client, "update_site", args, asJson);
     }

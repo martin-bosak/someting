@@ -27,6 +27,7 @@ export async function migrate() {
       runtime text not null,
       repo_url text not null,
       branch text not null default 'main',
+      repo_subdir text not null default '',
       build_command text,
       start_command text,
       healthcheck_path text default '/',
@@ -34,6 +35,9 @@ export async function migrate() {
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
+
+    alter table sites
+      add column if not exists repo_subdir text not null default '';
 
     alter table sites
       add constraint sites_runtime_check
@@ -74,5 +78,41 @@ export async function migrate() {
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
+
+    create table if not exists dns_domains (
+      id bigserial primary key,
+      domain text not null unique,
+      provider text not null check (provider in ('wedos', 'active24')),
+      created_at timestamptz not null default now()
+    );
+
+    create table if not exists activity_log (
+      id bigserial primary key,
+      at timestamptz not null default now(),
+      category text not null,
+      action text not null,
+      target text,
+      status text not null default 'ok',
+      detail text,
+      duration_ms integer
+    );
+
+    create index if not exists activity_log_at_idx on activity_log (at desc);
+    create index if not exists activity_log_category_idx on activity_log (category, at desc);
   `);
+
+  // Seed the provider→domain assignments once, only when the table is empty so
+  // later add/remove edits from the Config page are not clobbered on restart.
+  const existing = await pool.query<{ count: string }>("select count(*)::text as count from dns_domains");
+  if (existing.rows[0]?.count === "0") {
+    await pool.query(
+      `insert into dns_domains (domain, provider) values
+        ('foodik.cz', 'wedos'),
+        ('martinbosak.cz', 'wedos'),
+        ('menteemo.com', 'wedos'),
+        ('marbos.cz', 'active24'),
+        ('somesoft.net', 'active24')
+       on conflict (domain) do nothing`,
+    );
+  }
 }

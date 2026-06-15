@@ -56,3 +56,30 @@ docker compose ps
 ```
 
 If the deploy fails, fix the site template or commands and run the deploy again. The previous release directories are kept under `/srv/hosting/sites/my-site/releases`.
+
+## Monorepos (one repo, multiple sites)
+
+When a single Git repository contains more than one deployable app (for example `frontend/` and `backend/`), create a separate site for each part. Use the same repository URL on every site, but set a different **Repository subdirectory** for each one.
+
+In the admin UI, leave **Repository subdirectory** empty to deploy the repo root. To deploy only a folder inside the repo, enter a relative path such as `frontend` or `apps/api` (no leading slash).
+
+Example: two sites from `https://github.com/example/monorepo.git`:
+
+| Site slug   | Subdirectory | Typical runtime |
+|-------------|--------------|-----------------|
+| `my-api`    | `backend`    | `node` or `python` |
+| `my-app`    | `frontend`   | `static` or `node` |
+
+Each site gets its own domains, build command, and container. On deploy the full repo is cloned, but only the chosen subdirectory is used as the Docker build context.
+
+If you provision sites from the shell instead of the admin UI, set `REPO_SUBDIR` in `site.env`:
+
+```bash
+REPO_SUBDIR=frontend
+```
+
+Or via the CLI:
+
+```bash
+someting create my-app --name "My App" --runtime static --repo https://github.com/example/monorepo.git --subdir frontend --build "npm run build"
+```

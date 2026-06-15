@@ -5,8 +5,10 @@ import {
   addMailNote,
   applyPathRouteBySlug,
   applyRouteBySlug,
+  changeSiteRuntime,
   createSite,
   provisionDatabase,
+  deleteSiteBySlug,
   deleteSiteStorageEntry,
   deploySiteBySlug,
   execInSiteBySlug,
@@ -53,6 +55,7 @@ export function createMcpServer() {
         runtime: z.enum(["php", "node", "python", "static", "html"]),
         repo_url: z.string().regex(/^(https:\/\/|git@|ssh:\/\/|upload:\/\/).+/),
         branch: z.string().min(1).default("main"),
+        repo_subdir: z.string().default(""),
         build_command: z.string().optional(),
         start_command: z.string().optional(),
         healthcheck_path: z.string().startsWith("/").default("/"),
@@ -164,12 +167,14 @@ export function createMcpServer() {
     {
       title: "Update site",
       description:
-        "Update editable site metadata: name, repo_url, branch, build_command, start_command, healthcheck_path. Slug and runtime are fixed after provision.",
+        "Update editable site metadata: name, repo_url, branch, repo_subdir, build_command, start_command, healthcheck_path, and optionally runtime. Slug is fixed after provision. Changing runtime swaps the Dockerfile/compose template — run deploy_site or recreate_site afterwards.",
       inputSchema: {
         slug: z.string().min(1),
         name: z.string().min(1),
+        runtime: z.enum(["php", "node", "python", "static", "html"]).optional(),
         repo_url: z.string().regex(/^(https:\/\/|git@|ssh:\/\/|upload:\/\/).+/),
         branch: z.string().min(1),
+        repo_subdir: z.string().default(""),
         build_command: z.string().optional().nullable(),
         start_command: z.string().optional().nullable(),
         healthcheck_path: z.string().startsWith("/").default("/"),
@@ -179,6 +184,40 @@ export function createMcpServer() {
       const site = await getSiteBySlug(slug);
       return text(await updateSiteMetadata(Number(site.id), rest));
     },
+  );
+
+  server.registerTool(
+    "change_runtime",
+    {
+      title: "Change site runtime",
+      description:
+        "Swap a site's runtime template (Dockerfile + compose.yaml) to html, static, node, python, or php and update the DB row. Does not rebuild the container — run deploy_site (rebuild) or recreate_site (no rebuild) afterwards.",
+      inputSchema: {
+        slug: z.string().min(1),
+        runtime: z.enum(["php", "node", "python", "static", "html"]),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ slug, runtime }) => text(await changeSiteRuntime(slug, runtime)),
+  );
+
+  server.registerTool(
+    "delete_site",
+    {
+      title: "Delete site",
+      description:
+        "Permanently delete a site: stops and removes its container, drops its Caddy route files and reloads Caddy, removes the on-disk site directory (including persistent /data storage), and deletes the DB row (cascades domains and deployments). Irreversible.",
+      inputSchema: {
+        slug: z.string().min(1),
+      },
+      annotations: {
+        destructiveHint: true,
+        openWorldHint: true,
+      },
+    },
+    async ({ slug }) => text(await deleteSiteBySlug(slug)),
   );
 
   server.registerTool(

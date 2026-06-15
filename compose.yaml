@@ -2,7 +2,7 @@ name: someting
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-someting}
@@ -57,6 +57,12 @@ services:
       HOSTING_ROOT: ${HOSTING_ROOT:-/srv/hosting}
       CREATE_SITE_SCRIPT: ${CREATE_SITE_SCRIPT:-/srv/hosting/bin/create-site.sh}
       DEPLOY_SCRIPT: ${DEPLOY_SCRIPT:-/srv/hosting/bin/deploy-site.sh}
+      WEDOS_WAPI_USER: ${WEDOS_WAPI_USER:-}
+      WEDOS_WAPI_PASSWORD: ${WEDOS_WAPI_PASSWORD:-}
+      WEDOS_A_RECORD_IP: ${WEDOS_A_RECORD_IP:-}
+      ACTIVE24_API_ID: ${ACTIVE24_API_ID:-}
+      ACTIVE24_API_SECRET: ${ACTIVE24_API_SECRET:-}
+      ACTIVE24_A_RECORD_IP: ${ACTIVE24_A_RECORD_IP:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HOSTING_ROOT_HOST:-./runtime}:${HOSTING_ROOT:-/srv/hosting}

@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { recordActivity } from "./activityLog.js";
 import { config } from "./config.js";
 import { pool } from "./db.js";
 import { runCommand } from "./shell.js";
@@ -19,6 +20,7 @@ export type SiteRow = {
   runtime: string;
   repo_url: string;
   branch: string;
+  repo_subdir: string;
   build_command: string | null;
   start_command: string | null;
   healthcheck_path: string | null;
@@ -58,8 +60,8 @@ export async function createSite(body: unknown) {
   }
 
   const result = await pool.query<SiteRow>(
-    `insert into sites (slug, name, runtime, repo_url, branch, build_command, start_command, healthcheck_path)
-     values ($1, $2, $3, $4, $5, $6, $7, $8)
+    `insert into sites (slug, name, runtime, repo_url, branch, repo_subdir, build_command, start_command, healthcheck_path)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      returning *`,
     [
       input.slug,
@@ -67,13 +69,24 @@ export async function createSite(body: unknown) {
       input.runtime,
       input.repo_url,
       input.branch,
+      input.repo_subdir,
       input.build_command,
       input.start_command,
       input.healthcheck_path,
     ],
   );
 
-  return result.rows[0];
+  const site = result.rows[0];
+  await syncSiteEnv(site);
+
+  await recordActivity({
+    category: "site",
+    action: "Create site",
+    target: input.slug,
+    detail: `runtime=${input.runtime} repo=${input.repo_url} branch=${input.branch}${input.repo_subdir ? ` subdir=${input.repo_subdir}` : ""}`,
+  });
+
+  return site;
 }
 
 export async function updateSiteMetadata(siteId: number, body: unknown) {
@@ -81,14 +94,15 @@ export async function updateSiteMetadata(siteId: number, body: unknown) {
   const input = siteMetadataUpdateSchema.parse(body);
   await pool.query(
     `update sites
-     set name = $1, repo_url = $2, branch = $3,
-         build_command = $4, start_command = $5, healthcheck_path = $6,
+     set name = $1, repo_url = $2, branch = $3, repo_subdir = $4,
+         build_command = $5, start_command = $6, healthcheck_path = $7,
          updated_at = now()
-     where id = $7`,
+     where id = $8`,
     [
       input.name,
       input.repo_url,
       input.branch,
+      input.repo_subdir,
       input.build_command ?? null,
       input.start_command ?? null,
       input.healthcheck_path,
@@ -96,9 +110,127 @@ export async function updateSiteMetadata(siteId: number, body: unknown) {
     ],
   );
 
+  if (input.runtime && input.runtime !== site.runtime) {
+    await changeSiteRuntime(site.slug, input.runtime);
+  }
+
   const result = await pool.query<SiteRow>("select * from sites where id = $1", [site.id]);
+  await syncSiteEnv(result.rows[0]);
+
+  await recordActivity({
+    category: "site",
+    action: "Update site metadata",
+    target: site.slug,
+    detail: `name=${input.name} repo=${input.repo_url} branch=${input.branch}${input.repo_subdir ? ` subdir=${input.repo_subdir}` : ""}`,
+  });
 
   return result.rows[0];
+}
+
+// Swap a site's runtime template (Dockerfile + compose.yaml) and update the
+// DB row. The next deploy_site / recreate_site rebuilds the container against
+// the new template — this call alone does not restart anything.
+const RUNTIME_VALUES = new Set(["php", "node", "python", "static", "html"]);
+
+export async function changeSiteRuntime(slug: string, runtime: string) {
+  if (!RUNTIME_VALUES.has(runtime)) {
+    throw new Error(`Unknown runtime: ${runtime}`);
+  }
+  const site = await getSiteBySlug(slug);
+  if (site.runtime === runtime) {
+    return { site, runtime, changed: false };
+  }
+
+  const templateDir = join(config.HOSTING_ROOT, "templates", runtime);
+  const siteDir = join(config.HOSTING_ROOT, "sites", site.slug);
+
+  const dockerfile = await readFile(join(templateDir, "Dockerfile"), "utf8").catch(() => {
+    throw new Error(`Template not found for runtime "${runtime}".`);
+  });
+  const composeFile = await readFile(join(templateDir, "compose.yaml"), "utf8").catch(() => {
+    throw new Error(`Template compose file not found for runtime "${runtime}".`);
+  });
+
+  await mkdir(siteDir, { recursive: true });
+  await writeFile(join(siteDir, "Dockerfile"), dockerfile, { mode: 0o644 });
+  await writeFile(join(siteDir, "compose.yaml"), composeFile, { mode: 0o644 });
+
+  await pool.query("update sites set runtime = $1, updated_at = now() where id = $2", [
+    runtime,
+    site.id,
+  ]);
+
+  const updated = await getSiteBySlug(slug);
+  await syncSiteEnv(updated);
+
+  return {
+    site: updated,
+    runtime,
+    changed: true,
+    next_steps: "Run deploy_site or recreate_site to rebuild the container with the new runtime.",
+  };
+}
+
+// Tear a site fully down: stop+remove its compose project, drop its Caddy
+// route files, reload Caddy, delete the on-disk site directory, and delete
+// the DB row (cascades domains + deployments). Idempotent enough to recover
+// from a partially-deleted site.
+export async function deleteSiteBySlug(slug: string) {
+  const site = await getSiteBySlug(slug);
+  const siteDir = join(config.HOSTING_ROOT, "sites", site.slug);
+  const steps: { step: string; ok: boolean; output: string }[] = [];
+
+  const composeFile = join(siteDir, "compose.yaml");
+  const composeExists = await stat(composeFile).then(() => true).catch(() => false);
+  if (composeExists) {
+    const down = await runCommand(
+      "docker",
+      [
+        "compose",
+        "--env-file",
+        join(siteDir, "site.env"),
+        "-p",
+        `site-${slug}`,
+        "down",
+        "--remove-orphans",
+        "-v",
+      ],
+      5 * 60 * 1000,
+      { cwd: siteDir },
+    );
+    steps.push({ step: "docker compose down", ok: down.code === 0, output: down.output });
+  } else {
+    const rm = await runCommand("docker", ["rm", "-f", `site-${slug}`], 60_000);
+    steps.push({ step: "docker rm -f", ok: rm.code === 0, output: rm.output });
+  }
+
+  const caddyHost = join(config.HOSTING_ROOT, "caddy", "sites", `${slug}.caddy`);
+  const caddyPath = join(config.HOSTING_ROOT, "caddy", "paths", `${slug}.caddy`);
+  await rm(caddyHost, { force: true });
+  await rm(caddyPath, { force: true });
+  steps.push({ step: "remove caddy route files", ok: true, output: `${caddyHost}\n${caddyPath}` });
+
+  const reload = await runCommand(
+    "docker",
+    ["exec", "hosting-caddy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"],
+    60_000,
+  );
+  steps.push({ step: "caddy reload", ok: reload.code === 0, output: reload.output });
+
+  await rm(siteDir, { recursive: true, force: true });
+  steps.push({ step: "remove site directory", ok: true, output: siteDir });
+
+  await pool.query("delete from sites where id = $1", [site.id]);
+  steps.push({ step: "delete db row", ok: true, output: `site id ${site.id}` });
+
+  await recordActivity({
+    category: "site",
+    action: "Delete site",
+    target: slug,
+    detail: steps.map((s) => `${s.ok ? "ok" : "FAIL"} ${s.step}`).join("\n"),
+  });
+
+  return { slug, deleted: true, steps };
 }
 
 export async function addDomain(body: unknown) {
@@ -112,6 +244,14 @@ export async function addDomain(body: unknown) {
   const domain = result.rows[0];
 
   const site = await pool.query<SiteRow>("select * from sites where id = $1", [input.site_id]);
+  const slug = site.rowCount === 1 ? site.rows[0].slug : `site#${input.site_id}`;
+  await recordActivity({
+    category: "domain",
+    action: "Add domain",
+    target: input.hostname,
+    detail: `site=${slug}${input.is_primary ? " (primary)" : ""}`,
+  });
+
   if (site.rowCount === 1) {
     try {
       await applyRouteBySlug(site.rows[0].slug);
@@ -131,6 +271,12 @@ export async function addMailNote(body: unknown) {
      returning *`,
     [input.domain, input.mode, input.provider, input.notes],
   );
+  await recordActivity({
+    category: "mail",
+    action: "Save mail note",
+    target: input.domain,
+    detail: `mode=${input.mode}${input.provider ? ` provider=${input.provider}` : ""}`,
+  });
   return result.rows[0];
 }
 
@@ -180,6 +326,8 @@ export async function provisionDatabase(body: unknown) {
   } finally {
     client.release();
   }
+
+  await recordActivity({ category: "database", action: "Provision database", target: name });
 
   const host = "postgres";
   const port = 5432;
@@ -236,6 +384,14 @@ export async function deploySiteBySlug(slug: string) {
     site.id,
   ]);
 
+  await recordActivity({
+    category: "deploy",
+    action: "Deploy site",
+    target: site.slug,
+    status: result.code === 0 ? "ok" : "error",
+    detail: result.output.slice(-4000),
+  });
+
   return {
     site,
     status,
@@ -281,6 +437,7 @@ export async function listDeploymentLogsForSite(slug: string) {
 }
 
 export async function applyRouteBySlug(slug: string) {
+  const started = Date.now();
   const site = await getSiteBySlug(slug);
   const domains = await pool.query<{ hostname: string }>(
     "select hostname from domains where site_id = $1 order by is_primary desc, hostname",
@@ -288,28 +445,79 @@ export async function applyRouteBySlug(slug: string) {
   );
 
   if (domains.rowCount === 0) {
+    await recordActivity({
+      category: "route",
+      action: "Apply domain route",
+      target: site.slug,
+      status: "error",
+      detail: "No domains configured for this site.",
+      durationMs: Date.now() - started,
+    });
     throw new Error("Add at least one domain before applying a route.");
   }
 
   const hostnames = domains.rows.map((row) => row.hostname);
-  await writeCaddyRoute(site.slug, hostnames);
-  const reload = await runCommand("docker", ["exec", "hosting-caddy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"], 60_000);
+  try {
+    await writeCaddyRoute(site.slug, hostnames);
+    const reload = await runCommand("docker", ["exec", "hosting-caddy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"], 60_000);
 
-  if (reload.code !== 0) {
-    throw new Error(reload.output || "Caddy reload failed");
+    if (reload.code !== 0) {
+      throw new Error(reload.output || "Caddy reload failed");
+    }
+  } catch (err) {
+    await recordActivity({
+      category: "route",
+      action: "Apply domain route",
+      target: site.slug,
+      status: "error",
+      detail: `${hostnames.join(", ")}\n${err instanceof Error ? err.message : String(err)}`,
+      durationMs: Date.now() - started,
+    });
+    throw err;
   }
+
+  await recordActivity({
+    category: "route",
+    action: "Apply domain route",
+    target: site.slug,
+    status: "ok",
+    detail: `Caddy reverse-proxy route for: ${hostnames.join(", ")}`,
+    durationMs: Date.now() - started,
+  });
 
   return { site, hostnames };
 }
 
 export async function applyPathRouteBySlug(slug: string) {
+  const started = Date.now();
   const site = await getSiteBySlug(slug);
-  await writeCaddyPathRoute(site.slug);
-  const reload = await runCommand("docker", ["exec", "hosting-caddy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"], 60_000);
+  try {
+    await writeCaddyPathRoute(site.slug);
+    const reload = await runCommand("docker", ["exec", "hosting-caddy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"], 60_000);
 
-  if (reload.code !== 0) {
-    throw new Error(reload.output || "Caddy reload failed");
+    if (reload.code !== 0) {
+      throw new Error(reload.output || "Caddy reload failed");
+    }
+  } catch (err) {
+    await recordActivity({
+      category: "route",
+      action: "Apply path route",
+      target: site.slug,
+      status: "error",
+      detail: `/sites/${site.slug}/\n${err instanceof Error ? err.message : String(err)}`,
+      durationMs: Date.now() - started,
+    });
+    throw err;
   }
+
+  await recordActivity({
+    category: "route",
+    action: "Apply path route",
+    target: site.slug,
+    status: "ok",
+    detail: `Caddy path route at /sites/${site.slug}/`,
+    durationMs: Date.now() - started,
+  });
 
   return {
     site,
@@ -327,8 +535,16 @@ export async function restartSiteBySlug(slug: string) {
   const site = await getSiteBySlug(slug);
   const result = await runCommand("docker", ["restart", `site-${slug}`], 60_000);
   if (result.code !== 0) {
+    await recordActivity({
+      category: "site",
+      action: "Restart site",
+      target: slug,
+      status: "error",
+      detail: result.output,
+    });
     throw new Error(result.output || `docker restart site-${slug} failed`);
   }
+  await recordActivity({ category: "site", action: "Restart site", target: slug });
   return { site, output: result.output };
 }
 
@@ -352,8 +568,16 @@ export async function recreateSiteBySlug(slug: string) {
     { cwd: siteDir },
   );
   if (result.code !== 0) {
+    await recordActivity({
+      category: "site",
+      action: "Recreate site",
+      target: slug,
+      status: "error",
+      detail: result.output.slice(-4000),
+    });
     throw new Error(result.output || `recreate failed for site-${slug}`);
   }
+  await recordActivity({ category: "site", action: "Recreate site", target: slug });
   return { site, output: result.output };
 }
 
@@ -458,6 +682,7 @@ async function syncSiteEnv(site: SiteRow) {
     `RUNTIME=${shellQuote(site.runtime)}\n` +
     `REPO_URL=${shellQuote(site.repo_url)}\n` +
     `BRANCH=${shellQuote(site.branch)}\n` +
+    `REPO_SUBDIR=${shellQuote(site.repo_subdir ?? "")}\n` +
     `BUILD_COMMAND=${shellQuote(site.build_command ?? "")}\n` +
     `START_COMMAND=${shellQuote(site.start_command ?? "")}\n` +
     `SERVICE_PORT=8080\n`;
@@ -504,6 +729,70 @@ export async function getVisitCount(slug: string) {
     // ignore
   }
   return 0;
+}
+
+export type WeeklyVisits = {
+  weeks: { start: number; count: number }[];
+  recentTotal: number;
+  allTime: number;
+};
+
+// Parse the Caddy JSON access log and bucket hits into the last `weeks` rolling
+// 7-day windows (oldest first). Each line carries a numeric `ts` (unix seconds);
+// we grab it with a cheap regex and fall back to JSON.parse for odd formats.
+export async function getWeeklyVisits(slug: string, weeks = 10): Promise<WeeklyVisits> {
+  const logPath = join(config.HOSTING_ROOT, "caddy", "data", `access-${slug}.log`);
+  const now = Date.now();
+  const weekMs = 7 * 24 * 60 * 60 * 1000;
+  const buckets = new Array<number>(weeks).fill(0);
+  let recentTotal = 0;
+  let allTime = 0;
+
+  let content = "";
+  try {
+    content = await readFile(logPath, "utf8");
+  } catch {
+    // no log yet — return empty buckets
+  }
+
+  if (content) {
+    for (const line of content.split("\n")) {
+      if (!line) continue;
+
+      let tsMs: number | null = null;
+      const match = line.match(/"ts":\s*([0-9.]+)/);
+      if (match) {
+        tsMs = parseFloat(match[1]) * 1000;
+      } else {
+        try {
+          const obj = JSON.parse(line) as { ts?: unknown };
+          if (typeof obj.ts === "number") {
+            tsMs = obj.ts * 1000;
+          } else if (typeof obj.ts === "string") {
+            const parsed = Date.parse(obj.ts);
+            if (!Number.isNaN(parsed)) tsMs = parsed;
+          }
+        } catch {
+          continue;
+        }
+      }
+      if (tsMs === null || Number.isNaN(tsMs)) continue;
+
+      allTime += 1;
+      const idx = Math.floor((now - tsMs) / weekMs); // 0 = current rolling week
+      if (idx >= 0 && idx < weeks) {
+        buckets[idx] += 1;
+        recentTotal += 1;
+      }
+    }
+  }
+
+  const series: { start: number; count: number }[] = [];
+  for (let i = weeks - 1; i >= 0; i--) {
+    series.push({ start: now - (i + 1) * weekMs, count: buckets[i] });
+  }
+
+  return { weeks: series, recentTotal, allTime };
 }
 
 // --- Persistent site storage (the ./shared dir mounted at /data in the container) ---
