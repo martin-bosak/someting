@@ -79,3 +79,14 @@ After restoring Caddy config, reload it:
 ```bash
 docker exec hosting-caddy caddy reload --config /etc/caddy/Caddyfile
 ```
+
+## Admin visibility
+
+The control plane exposes a read-only **Backups** page at `/admin/backups` with:
+
+- files under `/srv/hosting/backups`
+- latest Postgres dump age
+- tail of `/srv/hosting/logs/backup.log`
+- manual restore guidance
+
+Destructive restore actions remain manual by design.

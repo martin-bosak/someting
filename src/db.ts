@@ -32,12 +32,24 @@ export async function migrate() {
       start_command text,
       healthcheck_path text default '/',
       status text not null default 'created',
+      last_health_status text,
+      last_health_checked_at timestamptz,
+      last_health_error text,
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
 
     alter table sites
       add column if not exists repo_subdir text not null default '';
+
+    alter table sites
+      add column if not exists last_health_status text;
+
+    alter table sites
+      add column if not exists last_health_checked_at timestamptz;
+
+    alter table sites
+      add column if not exists last_health_error text;
 
     alter table sites
       add constraint sites_runtime_check
@@ -56,10 +68,22 @@ export async function migrate() {
       site_id bigint not null references sites(id) on delete cascade,
       status text not null default 'queued',
       commit_sha text,
+      release_id text,
+      trigger text,
+      health_status text,
       output text not null default '',
       started_at timestamptz not null default now(),
       finished_at timestamptz
     );
+
+    alter table deployments
+      add column if not exists release_id text;
+
+    alter table deployments
+      add column if not exists trigger text;
+
+    alter table deployments
+      add column if not exists health_status text;
 
     create table if not exists mail_notes (
       id bigserial primary key,

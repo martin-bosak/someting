@@ -63,6 +63,10 @@ services:
       ACTIVE24_API_ID: ${ACTIVE24_API_ID:-}
       ACTIVE24_API_SECRET: ${ACTIVE24_API_SECRET:-}
       ACTIVE24_A_RECORD_IP: ${ACTIVE24_A_RECORD_IP:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      BACKUP_DIR: ${BACKUP_DIR:-/srv/hosting/backups}
+      MANAGEMENT_HOST: ${MANAGEMENT_HOST:-localhost}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HOSTING_ROOT_HOST:-./runtime}:${HOSTING_ROOT:-/srv/hosting}

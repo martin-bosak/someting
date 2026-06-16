@@ -15,6 +15,10 @@ const envSchema = z.object({
   ACTIVE24_API_ID: z.string().optional(),
   ACTIVE24_API_SECRET: z.string().optional(),
   ACTIVE24_A_RECORD_IP: z.string().optional(),
+  GITHUB_WEBHOOK_SECRET: z.string().min(16).optional(),
+  ALERT_WEBHOOK_URL: z.string().url().optional(),
+  BACKUP_DIR: z.string().min(1).default("/srv/hosting/backups"),
+  MANAGEMENT_HOST: z.string().min(1).default("localhost"),
 });
 
 export const config = envSchema.parse(process.env);

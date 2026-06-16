@@ -40,6 +40,15 @@ tail -f /srv/hosting/logs/deploy-my-site.log
 
 Add Loki or another log stack only after disk and memory usage are well understood.
 
+## Auto-Deploy, Health, Rollback, Alerts
+
+- GitHub push webhooks can trigger deploys when `GITHUB_WEBHOOK_SECRET` is set. See `docs/github-webhooks.md`.
+- Each site should configure a realistic `healthcheck_path` (for example `/` or `/health`).
+- Failed health checks after deploy attempt to restore the previous release automatically.
+- Retained releases can also be rolled back manually from the site detail page.
+- Optional `ALERT_WEBHOOK_URL` sends best-effort JSON alerts for deploy failures, unhealthy rollbacks, and stale backups.
+- `/admin/backups` and `/admin/observability` surface backup freshness and runtime health without destructive restore buttons.
+
 ## Database Isolation
 
 Use one PostgreSQL instance with separate database users and databases per site:

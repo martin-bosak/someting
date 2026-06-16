@@ -18,6 +18,13 @@ There are two supported transports:
 - `read_site_env`: read a site's runtime `.env` file.
 - `write_site_env`: replace a site's runtime `.env` file.
 - `add_mail_note`: record mail handling for a domain.
+- `list_site_releases`: list retained release directories for rollback.
+- `rollback_site`: repoint a site to a previous release and recreate its container.
+- `check_site_health`: probe a site over its configured healthcheck path.
+- `get_backup_status`: list on-server backup files and backup log tail.
+- `get_observability_summary`: aggregate health, deploy failures, runtime stats, and traffic.
+
+Many additional tools also exist for storage, deploy auth, database provisioning, site deletion, and metadata updates. Run `platform_status` or inspect `src/mcpServer.ts` for the full surface.
 
 ## External HTTP MCP
 

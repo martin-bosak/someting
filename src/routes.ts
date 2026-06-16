@@ -1,5 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import { clearSessionCookie, createSessionCookie, verifyAdminCredentials } from "./auth.js";
+import { config } from "./config.js";
+import {
+  findSitesForGithubPush,
+  verifyGithubSignature,
+  type GithubPushEvent,
+} from "./githubWebhook.js";
 import {
   addDomain,
   addMailNote,
@@ -11,11 +17,15 @@ import {
   deleteSiteStorageEntry,
   deploySiteBySlug,
   execInSiteBySlug,
+  getBackupStatus,
   getDeploymentLogById,
+  getObservabilitySummary,
   getSiteById,
   getSiteLogsBySlug,
   getWeeklyVisits,
   listDeploymentLogsForSite,
+  listSiteReleases,
+  rollbackSiteBySlug,
   type WeeklyVisits,
   listPlatformState,
   listSiteStorage,
@@ -47,6 +57,72 @@ import {
 export async function registerRoutes(app: FastifyInstance) {
   app.get("/healthz", async () => ({ ok: true }));
 
+  app.post("/webhooks/github", async (request, reply) => {
+    const rawBody = request.rawBody;
+    if (!rawBody) {
+      return reply.code(400).send({ ok: false, error: "Missing request body" });
+    }
+    if (!config.GITHUB_WEBHOOK_SECRET) {
+      return reply.code(503).send({ ok: false, error: "GITHUB_WEBHOOK_SECRET is not configured" });
+    }
+    const signature = request.headers["x-hub-signature-256"];
+    if (!verifyGithubSignature(rawBody, typeof signature === "string" ? signature : undefined)) {
+      await recordActivity({
+        category: "deploy",
+        action: "GitHub webhook rejected",
+        status: "error",
+        detail: "Invalid X-Hub-Signature-256",
+      });
+      return reply.code(401).send({ ok: false, error: "Invalid signature" });
+    }
+
+    const event = request.headers["x-github-event"];
+    if (event !== "push") {
+      return reply.send({ ok: true, ignored: true, reason: `event=${String(event)}` });
+    }
+
+    let payload: GithubPushEvent;
+    try {
+      payload = JSON.parse(rawBody.toString("utf8")) as GithubPushEvent;
+    } catch {
+      return reply.code(400).send({ ok: false, error: "Invalid JSON payload" });
+    }
+
+    const sites = await findSitesForGithubPush(payload.repository ?? {}, payload.ref ?? "");
+    if (sites.length === 0) {
+      await recordActivity({
+        category: "deploy",
+        action: "GitHub webhook ignored",
+        status: "info",
+        detail: `No matching site for ${payload.repository?.full_name ?? "unknown"}@${payload.ref ?? ""}`,
+      });
+      return reply.send({ ok: true, ignored: true, reason: "no_matching_site" });
+    }
+
+    const results = [];
+    for (const site of sites) {
+      try {
+        const result = await deploySiteBySlug(site.slug, {
+          trigger: "github_webhook",
+          expectedCommitSha: payload.head_commit?.id ?? undefined,
+        });
+        results.push({ slug: site.slug, status: result.status });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        results.push({ slug: site.slug, status: "error", error: message });
+        await recordActivity({
+          category: "deploy",
+          action: "GitHub webhook deploy failed",
+          target: site.slug,
+          status: "error",
+          detail: message,
+        });
+      }
+    }
+
+    return reply.send({ ok: true, deployed: results });
+  });
+
   app.get("/favicon.svg", async (_request, reply) => {
     return reply
       .header("Cache-Control", "public, max-age=86400, immutable")
@@ -64,14 +140,15 @@ export async function registerRoutes(app: FastifyInstance) {
   });
 
   app.post("/login", async (request, reply) => {
-    const body = request.body as { username?: string; password?: string; next?: string };
+    const body = request.body as { username?: string; password?: string; next?: string; remember?: string };
     const next = body.next?.startsWith("/") ? body.next : "/admin";
+    const remember = body.remember === "true" || body.remember === "on";
 
     if (!(await verifyAdminCredentials(body.username ?? "", body.password ?? ""))) {
       return reply.code(401).type("text/html").send(renderLogin(next, "Invalid username or password."));
     }
 
-    return reply.header("Set-Cookie", createSessionCookie(body.username ?? "")).redirect(next);
+    return reply.header("Set-Cookie", createSessionCookie(body.username ?? "", remember)).redirect(next);
   });
 
   app.post("/logout", async (_request, reply) => {
@@ -124,10 +201,11 @@ export async function registerRoutes(app: FastifyInstance) {
     const site = await getSite(request.params);
     const state = await listPlatformState();
     const siteDomains = state.domains.filter((d) => d.site_id === site.id);
-    const [visits, deployments, activity] = await Promise.all([
+    const [visits, deployments, activity, releases] = await Promise.all([
       getWeeklyVisits(site.slug),
       listDeploymentLogsForSite(site.slug).catch(() => []),
       listActivityForSite(site.slug, 40).catch(() => []),
+      listSiteReleases(site.slug).catch(() => ({ activeRelease: null, releases: [] })),
     ]);
     let containerLogs = "";
     try {
@@ -137,7 +215,7 @@ export async function registerRoutes(app: FastifyInstance) {
     }
     return reply
       .type("text/html")
-      .send(renderSiteDetailPage(site, siteDomains, visits, deployments, activity, containerLogs));
+      .send(renderSiteDetailPage(site, siteDomains, visits, deployments, activity, containerLogs, releases));
   });
 
   app.post("/admin/sites/:id/update", async (request, reply) => {
@@ -326,6 +404,27 @@ export async function registerRoutes(app: FastifyInstance) {
     return reply.type("application/json").send(result);
   });
 
+  app.post("/admin/sites/:id/rollback", async (request, reply) => {
+    const site = await getSite(request.params);
+    const body = request.body as { release_id?: string };
+    const releaseId = (body.release_id ?? "").trim();
+    if (!releaseId) {
+      throw new Error("release_id is required");
+    }
+    await rollbackSiteBySlug(site.slug, releaseId);
+    return reply.redirect(`/admin/sites/${site.id}/detail`);
+  });
+
+  app.get("/admin/backups", async (_request, reply) => {
+    const backup = await getBackupStatus();
+    return reply.type("text/html").send(renderBackupsPage(backup));
+  });
+
+  app.get("/admin/observability", async (_request, reply) => {
+    const summary = await getObservabilitySummary();
+    return reply.type("text/html").send(renderObservabilityPage(summary));
+  });
+
   app.post("/admin/sites/:id/deploy", async (request, reply) => {
     const site = await getSite(request.params);
     await deploySiteBySlug(site.slug);
@@ -512,6 +611,8 @@ ${renderFaviconTags()}
         <a href="/admin/websites" class="${websitesNavActive(currentPath) ? "active" : ""}">Websites</a>
         <a href="/admin/domains" class="${currentPath.startsWith("/admin/domains") ? "active" : ""}">Domains</a>
         <a href="/admin/deployments" class="${currentPath.startsWith("/admin/deployments") ? "active" : ""}">Deployments</a>
+        <a href="/admin/observability" class="${currentPath.startsWith("/admin/observability") ? "active" : ""}">Observability</a>
+        <a href="/admin/backups" class="${currentPath.startsWith("/admin/backups") ? "active" : ""}">Backups</a>
         <a href="/admin/logs" class="${currentPath.startsWith("/admin/logs") ? "active" : ""}">Logs</a>
         <a href="/admin/config" class="${currentPath.startsWith("/admin/config") ? "active" : ""}">Config</a>
       </div>
@@ -879,6 +980,28 @@ function renderVisitsChart(visits: WeeklyVisits | undefined) {
   return `<svg class="visits-chart" viewBox="0 0 ${width} ${h}" width="${width}" height="${h}" role="img" aria-label="Visits per week, last ${series.length} weeks">${bars}</svg>`;
 }
 
+function renderHealthBadge(site: SiteRow) {
+  const status = site.last_health_status ?? "unknown";
+  const tone = status === "healthy" ? "good" : status === "unhealthy" ? "bad" : "neutral";
+  const title = site.last_health_error
+    ? escapeHtml(site.last_health_error)
+    : site.last_health_checked_at
+      ? `Checked ${formatDate(site.last_health_checked_at)}`
+      : "Not checked yet";
+  return `<span class="status-pill ${tone}" title="${title}">health: ${escapeHtml(status)}</span>`;
+}
+
+function renderGithubWebhookInfo() {
+  const configured = Boolean(config.GITHUB_WEBHOOK_SECRET);
+  const host = config.MANAGEMENT_HOST === "localhost" ? "your-admin-host" : config.MANAGEMENT_HOST;
+  const endpoint = `https://${host}/webhooks/github`;
+  return `<div class="webhook-box">
+    <p class="lede">Configure a GitHub repository webhook with content type <code>application/json</code>, secret matching <code>GITHUB_WEBHOOK_SECRET</code>, and events: <strong>Just the push event</strong>.</p>
+    <p><span class="detail-label">Endpoint</span> <code>${escapeHtml(endpoint)}</code></p>
+    <p><span class="detail-label">Secret configured</span> <span class="status-pill ${configured ? "good" : "warn"}">${configured ? "yes" : "no"}</span></p>
+  </div>`;
+}
+
 function renderSiteCard(site: SiteRow, siteDomains: any[], visits: WeeklyVisits | undefined) {
   const domainList = siteDomains.length > 0
     ? siteDomains
@@ -894,6 +1017,7 @@ function renderSiteCard(site: SiteRow, siteDomains: any[], visits: WeeklyVisits 
       <div class="site-row-id">
         <h3>${escapeHtml(site.slug)}</h3>
         <span class="status-pill ${statusTone(site.status)}">${escapeHtml(site.status)}</span>
+        ${renderHealthBadge(site)}
         <span class="runtime-tag">${escapeHtml(site.runtime)}</span>
       </div>
       <div class="site-visits">
@@ -987,6 +1111,7 @@ function renderSiteDetailPage(
   deployments: any[],
   activity: ActivityRow[],
   containerLogs: string,
+  releases: { activeRelease: string | null; releases: { id: string; active: boolean }[] },
 ) {
   const primary = siteDomains.find((d) => d.is_primary) ?? siteDomains[0];
   const repoUrlClean = site.repo_url.replace(".git", "");
@@ -1004,6 +1129,7 @@ function renderSiteDetailPage(
     ["Branch", `<code>${escapeHtml(site.branch)}</code>`],
     ["Subdirectory", site.repo_subdir ? `<code>${escapeHtml(site.repo_subdir)}/</code>` : `<span class="muted">repo root</span>`],
     ["Healthcheck", `<code>${escapeHtml(site.healthcheck_path ?? "/")}</code>`],
+    ["Health status", renderHealthBadge(site)],
     ["Build command", site.build_command ? `<code>${escapeHtml(site.build_command)}</code>` : `<span class="muted">none</span>`],
     ["Start command", site.start_command ? `<code>${escapeHtml(site.start_command)}</code>` : `<span class="muted">none</span>`],
   ]
@@ -1036,12 +1162,39 @@ function renderSiteDetailPage(
     ? `<ul class="stack-list">${deployments
         .map(
           (d) => `<li>
-            <span><span class="status-pill ${statusTone(d.status)}">${escapeHtml(d.status)}</span> <a href="/admin/deployments/${d.id}/logs">View logs</a></span>
-            <small>${escapeHtml(formatDate(d.started_at))}</small>
+            <span>
+              <span class="status-pill ${statusTone(d.status)}">${escapeHtml(d.status)}</span>
+              ${d.commit_sha ? `<code>${escapeHtml(String(d.commit_sha).slice(0, 7))}</code>` : ""}
+              ${d.release_id ? `<small class="muted">release ${escapeHtml(d.release_id)}</small>` : ""}
+              ${d.trigger ? `<small class="muted">${escapeHtml(d.trigger)}</small>` : ""}
+              <a href="/admin/deployments/${d.id}/logs">View logs</a>
+            </span>
+            <small>${escapeHtml(formatDate(d.started_at))}${d.health_status ? ` · health ${escapeHtml(d.health_status)}` : ""}</small>
           </li>`,
         )
         .join("")}</ul>`
     : `<div class="mini-empty">No deployments have run for this site yet.</div>`;
+
+  const releasesHtml = releases.releases.length > 0
+    ? `<ul class="stack-list">${releases.releases
+        .map(
+          (release) => `<li>
+            <span>
+              <code>${escapeHtml(release.id)}</code>
+              ${release.active ? `<span class="status-pill good">active</span>` : ""}
+            </span>
+            ${
+              release.active
+                ? `<small class="muted">current release</small>`
+                : `<form method="post" action="/admin/sites/${site.id}/rollback" onsubmit="return confirm('Roll back ${escapeHtml(site.slug)} to release ${escapeHtml(release.id)}?');">
+                    <input type="hidden" name="release_id" value="${escapeHtml(release.id)}">
+                    <button class="button button-soft">Rollback</button>
+                  </form>`
+            }
+          </li>`,
+        )
+        .join("")}</ul>`
+    : `<div class="mini-empty">No retained releases yet. Git deploys keep the latest five release folders.</div>`;
 
   const content = `
     <section class="panel paper paper-mint site-detail-head">
@@ -1129,6 +1282,18 @@ function renderSiteDetailPage(
       <section class="panel paper">
         <div class="section-heading"><div><p class="eyebrow">History</p><h2>Deployments</h2></div></div>
         ${deploymentsHtml}
+      </section>
+    </section>
+
+    <section class="detail-columns">
+      <section class="panel paper paper-sky">
+        <div class="section-heading"><div><p class="eyebrow">Releases</p><h2>Rollback</h2></div></div>
+        <p class="lede">Each Git deploy keeps up to five timestamped releases. Roll back by repointing <code>current</code> and recreating the container.</p>
+        ${releasesHtml}
+      </section>
+      <section class="panel paper paper-peach">
+        <div class="section-heading"><div><p class="eyebrow">Automation</p><h2>GitHub Webhook</h2></div></div>
+        ${renderGithubWebhookInfo()}
       </section>
     </section>
 
@@ -1482,15 +1647,144 @@ function renderDeployments(deployments: any[]) {
         <div>
           <strong>${escapeHtml(deployment.slug)}</strong>
           <span>${escapeHtml(formatDate(deployment.started_at))}</span>
+          ${deployment.commit_sha ? `<small><code>${escapeHtml(String(deployment.commit_sha).slice(0, 7))}</code></small>` : ""}
+          ${deployment.trigger ? `<small class="muted">${escapeHtml(deployment.trigger)}</small>` : ""}
         </div>
         <span class="status-pill ${statusTone(deployment.status)}">${escapeHtml(deployment.status)}</span>
         <div class="deployment-actions">
-          <small>${escapeHtml(deployment.finished_at ? `Finished ${formatDate(deployment.finished_at)}` : "Still running")}</small>
+          <small>${escapeHtml(deployment.finished_at ? `Finished ${formatDate(deployment.finished_at)}` : "Still running")}${deployment.health_status ? ` · health ${escapeHtml(deployment.health_status)}` : ""}</small>
           <a class="button button-link" href="/admin/deployments/${deployment.id}/logs">Deployment Logs</a>
         </div>
       </article>`,
     )
     .join("")}</div>`;
+}
+
+function renderBackupsPage(backup: Awaited<ReturnType<typeof getBackupStatus>>) {
+  const filesHtml = backup.files.length
+    ? `<ul class="stack-list">${backup.files
+        .map(
+          (file) => `<li>
+            <span><code>${escapeHtml(file.name)}</code></span>
+            <small>${escapeHtml(formatBytes(file.size))} · ${escapeHtml(formatDate(file.modifiedAt))}</small>
+          </li>`,
+        )
+        .join("")}</ul>`
+    : `<div class="mini-empty">No backup files found in <code>${escapeHtml(backup.backupDir)}</code>.</div>`;
+
+  const content = `
+    <section class="panel paper paper-sky">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Disaster recovery</p>
+          <h2>Backup Status</h2>
+        </div>
+      </div>
+      <p class="lede">Read-only view of VPS-side Postgres dumps and backup log output. Full snapshots from your Windows host still live under <code>_BACKUP/</code>.</p>
+      <div class="detail-grid">
+        <div class="detail-cell"><span class="detail-label">Backup directory</span><div class="detail-value"><code>${escapeHtml(backup.backupDir)}</code></div></div>
+        <div class="detail-cell"><span class="detail-label">Latest Postgres dump</span><div class="detail-value">${backup.latestPostgres ? `<code>${escapeHtml(backup.latestPostgres.name)}</code>` : `<span class="muted">none</span>`}</div></div>
+        <div class="detail-cell"><span class="detail-label">Freshness</span><div class="detail-value"><span class="status-pill ${backup.stale ? "warn" : "good"}">${backup.stale ? "stale or missing" : "recent"}</span></div></div>
+      </div>
+    </section>
+
+    <section class="detail-columns">
+      <section class="panel paper">
+        <div class="section-heading"><div><p class="eyebrow">On-server files</p><h2>Available Backups</h2></div></div>
+        ${filesHtml}
+      </section>
+      <section class="panel paper paper-lavender">
+        <div class="section-heading"><div><p class="eyebrow">Cron output</p><h2>Backup Log</h2></div></div>
+        <pre class="logbox">${escapeHtml(backup.backupLogTail || "No backup log yet.")}</pre>
+      </section>
+    </section>
+
+    <section class="panel paper paper-peach">
+      <div class="section-heading"><div><p class="eyebrow">Manual restore</p><h2>Restore Guidance</h2></div></div>
+      <ol class="restore-steps">
+        <li>Postgres: open an SSH tunnel, then restore the latest <code>postgres-*.sql.gz</code> with <code>pg_restore</code> or <code>psql</code>.</li>
+        <li>Site volumes: extract each site's <code>shared/</code> tarball back under <code>/srv/hosting/sites/&lt;slug&gt;/</code>.</li>
+        <li>Deployed code: restore <code>sites-code.tar.gz</code> and <code>caddy.tar.gz</code> from a local <code>_BACKUP/&lt;stamp&gt;/</code> folder, then reload Caddy.</li>
+      </ol>
+      <p class="lede">See <code>docs/backup.md</code> for exact commands. Destructive restore actions are intentionally not exposed in the admin UI.</p>
+    </section>`;
+
+  return renderAdminLayout("Backups", "/admin/backups", content);
+}
+
+function renderObservabilityPage(summary: Awaited<ReturnType<typeof getObservabilitySummary>>) {
+  const unhealthyHtml = summary.unhealthySites.length
+    ? `<ul class="stack-list">${summary.unhealthySites
+        .map(
+          (site) => `<li>
+            <span><strong>${escapeHtml(site.slug)}</strong> ${renderHealthBadge(site)}</span>
+            <small>${escapeHtml(site.last_health_error ?? "No error detail")}</small>
+          </li>`,
+        )
+        .join("")}</ul>`
+    : `<div class="mini-empty">All checked sites are healthy.</div>`;
+
+  const failedDeployHtml = summary.recentFailedDeployments.length
+    ? `<ul class="stack-list">${summary.recentFailedDeployments
+        .map(
+          (deployment) => `<li>
+            <span><strong>${escapeHtml(deployment.slug)}</strong> <span class="status-pill ${statusTone(deployment.status)}">${escapeHtml(deployment.status)}</span></span>
+            <small>${escapeHtml(formatDate(deployment.started_at))}</small>
+          </li>`,
+        )
+        .join("")}</ul>`
+    : `<div class="mini-empty">No recent failed deployments.</div>`;
+
+  const runtimeHtml = summary.runtimeStats.length
+    ? `<ul class="stack-list">${summary.runtimeStats
+        .map(
+          (stat) => `<li>
+            <span><strong>${escapeHtml(stat.slug)}</strong> <span class="status-pill ${stat.running ? "good" : "bad"}">${stat.running ? "running" : "stopped"}</span></span>
+            <small>${stat.running ? `CPU ${escapeHtml(stat.cpuPercent ?? "—")} · RAM ${escapeHtml(stat.memoryUsage ?? "—")} (${escapeHtml(stat.memoryPercent ?? "—")})` : "Container not running"}</small>
+          </li>`,
+        )
+        .join("")}</ul>`
+    : `<div class="mini-empty">No runtime stats available.</div>`;
+
+  const trafficHtml = Object.keys(summary.visitTotals).length
+    ? `<ul class="stack-list">${Object.entries(summary.visitTotals)
+        .map(
+          ([slug, count]) => `<li><span><strong>${escapeHtml(slug)}</strong></span><small>${count} visits in last 10 weeks</small></li>`,
+        )
+        .join("")}</ul>`
+    : `<div class="mini-empty">No traffic data yet.</div>`;
+
+  const content = `
+    <section class="stats-grid" aria-label="Observability summary">
+      ${renderStatCard("Unhealthy sites", summary.unhealthySites.length, "Failed latest health check", "rose")}
+      ${renderStatCard("Failed deploys", summary.recentFailedDeployments.length, "Recent deploy/rollback issues", "peach")}
+      ${renderStatCard("Backup freshness", summary.backup.stale ? "Stale" : "OK", summary.backup.latestPostgres?.name ?? "No dump found", "sky")}
+      ${renderStatCard("Alert webhook", config.ALERT_WEBHOOK_URL ? "Configured" : "Off", config.ALERT_WEBHOOK_URL ? "Outbound alerts enabled" : "Set ALERT_WEBHOOK_URL to enable", "lavender")}
+    </section>
+
+    <section class="detail-columns">
+      <section class="panel paper paper-rose">
+        <div class="section-heading"><div><p class="eyebrow">Health</p><h2>Unhealthy Sites</h2></div></div>
+        ${unhealthyHtml}
+      </section>
+      <section class="panel paper">
+        <div class="section-heading"><div><p class="eyebrow">Deploys</p><h2>Recent Failures</h2></div></div>
+        ${failedDeployHtml}
+      </section>
+    </section>
+
+    <section class="detail-columns">
+      <section class="panel paper paper-mint">
+        <div class="section-heading"><div><p class="eyebrow">Containers</p><h2>Runtime Usage</h2></div></div>
+        ${runtimeHtml}
+      </section>
+      <section class="panel paper paper-lavender">
+        <div class="section-heading"><div><p class="eyebrow">Traffic</p><h2>Recent Visits</h2></div></div>
+        ${trafficHtml}
+      </section>
+    </section>`;
+
+  return renderAdminLayout("Observability", "/admin/observability", content);
 }
 
 function renderAdminStyles() {
@@ -1823,6 +2117,8 @@ function renderAdminStyles() {
     .readonly-block { margin-bottom: 1.1rem; }
     .readonly-block .detail-value { font-weight: 800; }
     .readonly-block small { color: var(--muted); display: block; margin-top: .38rem; font-weight: 500; font-size: .82rem; letter-spacing: normal; text-transform: none; }
+    .webhook-box { display: grid; gap: .65rem; }
+    .restore-steps { color: var(--muted); margin: 0; padding-left: 1.2rem; display: grid; gap: .45rem; }
     @media (max-width: 900px) {
       .hero, .form-grid, .stats-grid { grid-template-columns: 1fr 1fr; }
       .hero { align-items: stretch; }
@@ -1838,11 +2134,11 @@ function renderAdminStyles() {
 function statusTone(status: unknown) {
   const normalized = String(status ?? "").toLowerCase();
 
-  if (["deployed", "succeeded", "success", "healthy"].some((value) => normalized.includes(value))) {
+  if (["deployed", "succeeded", "success", "healthy", "rolled_back"].some((value) => normalized.includes(value))) {
     return "good";
   }
 
-  if (["failed", "error", "down"].some((value) => normalized.includes(value))) {
+  if (["failed", "error", "down", "unhealthy", "rollback_unhealthy"].some((value) => normalized.includes(value))) {
     return "bad";
   }
 
@@ -1909,6 +2205,7 @@ ${renderFaviconTags()}
         <input type="hidden" name="next" value="${escapeHtml(next)}">
         <label>Username <input name="username" autocomplete="username" required autofocus></label>
         <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+        <label class="check-row"><input type="checkbox" name="remember" value="true"> Remember me on this device for 30 days</label>
         <button class="button">Login</button>
       </form>
     </section>
@@ -2116,6 +2413,10 @@ function renderDeploymentLog(deployment: {
   output: string;
   started_at: Date;
   finished_at: Date | null;
+  commit_sha?: string | null;
+  release_id?: string | null;
+  trigger?: string | null;
+  health_status?: string | null;
 }) {
   return `<!doctype html>
 <html lang="en">
@@ -2132,7 +2433,7 @@ ${renderFaviconTags()}
       <div>
         <p class="eyebrow">Deployment output</p>
         <h1>${escapeHtml(deployment.slug)}</h1>
-        <p class="lede">Deployment #${escapeHtml(deployment.id)} started ${escapeHtml(formatDate(deployment.started_at))}.</p>
+        <p class="lede">Deployment #${escapeHtml(deployment.id)} started ${escapeHtml(formatDate(deployment.started_at))}.${deployment.commit_sha ? ` Commit <code>${escapeHtml(String(deployment.commit_sha).slice(0, 7))}</code>.` : ""}${deployment.release_id ? ` Release <code>${escapeHtml(deployment.release_id)}</code>.` : ""}</p>
       </div>
       <div class="hero-note">
         <span class="pin"></span>

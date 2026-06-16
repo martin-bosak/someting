@@ -27,6 +27,11 @@ import {
   writeDeployAuthBySlug,
   writeSiteEnvBySlug,
   writeSiteStorageFile,
+  getBackupStatus,
+  getObservabilitySummary,
+  listSiteReleases,
+  rollbackSiteBySlug,
+  checkSiteHealth,
 } from "./platform.js";
 
 export function createMcpServer() {
@@ -438,6 +443,67 @@ export function createMcpServer() {
       },
     },
     async (input) => text(await addMailNote(input)),
+  );
+
+  server.registerTool(
+    "list_site_releases",
+    {
+      title: "List site releases",
+      description: "List retained release directories for a site and identify the active release.",
+      inputSchema: {
+        slug: z.string().min(1),
+      },
+    },
+    async ({ slug }) => text(await listSiteReleases(slug)),
+  );
+
+  server.registerTool(
+    "rollback_site",
+    {
+      title: "Rollback site",
+      description: "Repoint a site to a retained release directory and recreate its container.",
+      inputSchema: {
+        slug: z.string().min(1),
+        release_id: z.string().min(1),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ slug, release_id }) => text(await rollbackSiteBySlug(slug, release_id)),
+  );
+
+  server.registerTool(
+    "check_site_health",
+    {
+      title: "Check site health",
+      description: "Probe the site container over the Docker network using its configured healthcheck path.",
+      inputSchema: {
+        slug: z.string().min(1),
+      },
+    },
+    async ({ slug }) => {
+      const site = await getSiteBySlug(slug);
+      return text(await checkSiteHealth(site.slug, site.healthcheck_path ?? "/"));
+    },
+  );
+
+  server.registerTool(
+    "get_backup_status",
+    {
+      title: "Get backup status",
+      description: "List on-server backup files, latest Postgres dump, and backup log tail.",
+    },
+    async () => text(await getBackupStatus()),
+  );
+
+  server.registerTool(
+    "get_observability_summary",
+    {
+      title: "Get observability summary",
+      description: "Aggregate unhealthy sites, failed deployments, runtime stats, backup freshness, and recent visit totals.",
+    },
+    async () => text(await getObservabilitySummary()),
   );
 
   return server;

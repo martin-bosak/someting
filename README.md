@@ -132,6 +132,24 @@ deploy\someting-mcp.cmd
 
 See `docs/mcp.md` for the Cursor MCP configuration snippet and available tools.
 
+## GitHub Auto-Deploy
+
+Configure `GITHUB_WEBHOOK_SECRET` and point a GitHub repository webhook at:
+
+```text
+https://<MANAGEMENT_HOST>/webhooks/github
+```
+
+See [docs/github-webhooks.md](docs/github-webhooks.md).
+
+## Rollback, Health Checks, Backups, Observability
+
+- **Rollback:** site detail pages list retained releases and offer one-click rollback.
+- **Health checks:** after deploy/recreate/rollback, Someting probes `http://site-<slug>:8080<healthcheck_path>` from the control plane.
+- **Backups:** `/admin/backups` shows on-server Postgres dumps and backup log output (read-only).
+- **Observability:** `/admin/observability` aggregates unhealthy sites, failed deploys, container usage, and traffic.
+- **Alerts:** set optional `ALERT_WEBHOOK_URL` to receive JSON notifications for deploy/health/backup issues.
+
 ## Private Repositories
 
 For private GitHub repos, open a site in the admin UI and choose `Deploy Auth`. You can configure either an HTTPS token or an SSH deploy key per site. See `docs/private-repos.md`.

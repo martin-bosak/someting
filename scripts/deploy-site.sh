@@ -33,12 +33,30 @@ fi
 mkdir -p "${SITE_DIR}/releases" "${HOSTING_ROOT}/logs"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
+PREVIOUS_CURRENT=""
+if [[ -L "${SITE_DIR}/current" ]]; then
+  PREVIOUS_CURRENT="$(readlink "${SITE_DIR}/current")"
+  echo "SOMETING_PREVIOUS_CURRENT=${PREVIOUS_CURRENT}"
+fi
+
+restore_current() {
+  if [[ -n "${PREVIOUS_CURRENT}" && -e "${PREVIOUS_CURRENT}" ]]; then
+    echo "[$(date -Iseconds)] Restoring previous current -> ${PREVIOUS_CURRENT}"
+    ln -sfn "${PREVIOUS_CURRENT}" "${SITE_DIR}/current"
+    (
+      cd "${SITE_DIR}"
+      docker compose --env-file "${SITE_ENV}" -p "site-${SLUG}" up -d --remove-orphans
+    ) || true
+  fi
+}
+
 if [[ -n "${REPO_SUBDIR:-}" ]]; then
   echo "[$(date -Iseconds)] Deploying ${SLUG} from ${REPO_URL}#${BRANCH} (subdir: ${REPO_SUBDIR})"
 else
   echo "[$(date -Iseconds)] Deploying ${SLUG} from ${REPO_URL}#${BRANCH}"
 fi
 
+RELEASE_ID=""
 if [[ "${REPO_URL}" == upload://* ]]; then
   if [[ ! -e "${SITE_DIR}/current" ]]; then
     echo "Uploaded site ${SLUG} has no current release. Use upload-static-site.sh first." >&2
@@ -72,12 +90,19 @@ EOF_ASKPASS
     SUBDIR_PATH="${RELEASE_DIR}/${REPO_SUBDIR}"
     if [[ ! -d "${SUBDIR_PATH}" ]]; then
       echo "REPO_SUBDIR ${REPO_SUBDIR} does not exist in the cloned repository." >&2
+      restore_current
       exit 1
     fi
     ln -sfn "${SUBDIR_PATH}" "${SITE_DIR}/current"
   else
     ln -sfn "${RELEASE_DIR}" "${SITE_DIR}/current"
   fi
+
+  COMMIT_SHA="$(git -C "${RELEASE_DIR}" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -n "${COMMIT_SHA}" ]]; then
+    echo "SOMETING_COMMIT_SHA=${COMMIT_SHA}"
+  fi
+  echo "SOMETING_RELEASE_ID=${RELEASE_ID}"
 fi
 
 if [[ ! -f "${SITE_DIR}/Dockerfile" || ! -f "${SITE_DIR}/compose.yaml" ]]; then
@@ -85,11 +110,17 @@ if [[ ! -f "${SITE_DIR}/Dockerfile" || ! -f "${SITE_DIR}/compose.yaml" ]]; then
   cp "${HOSTING_ROOT}/templates/${RUNTIME}/compose.yaml" "${SITE_DIR}/compose.yaml"
 fi
 
-(
+if ! (
   cd "${SITE_DIR}"
   docker compose --env-file "${SITE_ENV}" -p "site-${SLUG}" up -d --build --remove-orphans
-)
+); then
+  echo "[$(date -Iseconds)] Docker compose build/up failed for ${SLUG}" >&2
+  restore_current
+  exit 1
+fi
 
-find "${SITE_DIR}/releases" -mindepth 1 -maxdepth 1 -type d | sort -r | sed -n '6,$p' | xargs -r rm -rf
+if [[ -n "${RELEASE_ID}" ]]; then
+  find "${SITE_DIR}/releases" -mindepth 1 -maxdepth 1 -type d | sort -r | sed -n '6,$p' | xargs -r rm -rf
+fi
 
 echo "[$(date -Iseconds)] Deploy complete for ${SLUG}"

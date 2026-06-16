@@ -5,6 +5,7 @@ import { config } from "./config.js";
 
 const sessionCookieName = "someting_session";
 const sessionTtlSeconds = 12 * 60 * 60;
+const rememberTtlSeconds = 30 * 24 * 60 * 60;
 
 function safeEqual(left: string, right: string) {
   const leftBuffer = Buffer.from(left);
@@ -48,11 +49,12 @@ export async function requireAdmin(request: FastifyRequest, reply: FastifyReply)
   return reply.redirect(`/login?next=${encodeURIComponent(request.url)}`);
 }
 
-export function createSessionCookie(username: string) {
-  const expiresAt = Math.floor(Date.now() / 1000) + sessionTtlSeconds;
+export function createSessionCookie(username: string, remember = false) {
+  const ttlSeconds = remember ? rememberTtlSeconds : sessionTtlSeconds;
+  const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
   const payload = Buffer.from(JSON.stringify({ username, expiresAt })).toString("base64url");
   const signature = sign(payload);
-  return `${sessionCookieName}=${payload}.${signature}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${sessionTtlSeconds}`;
+  return `${sessionCookieName}=${payload}.${signature}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${ttlSeconds}`;
 }
 
 export function clearSessionCookie() {

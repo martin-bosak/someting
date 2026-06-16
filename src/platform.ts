@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
-import { recordActivity } from "./activityLog.js";
+import { mkdir, readdir, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { recordActivity, listActivity } from "./activityLog.js";
+import { sendAlert } from "./alerts.js";
 import { config } from "./config.js";
 import { pool } from "./db.js";
 import { runCommand } from "./shell.js";
@@ -25,6 +26,63 @@ export type SiteRow = {
   start_command: string | null;
   healthcheck_path: string | null;
   status: string;
+  last_health_status: string | null;
+  last_health_checked_at: Date | null;
+  last_health_error: string | null;
+};
+
+export type DeployTrigger = "manual" | "github_webhook" | "rollback";
+
+export type DeployOptions = {
+  trigger?: DeployTrigger;
+  expectedCommitSha?: string;
+};
+
+export type SiteRelease = {
+  id: string;
+  active: boolean;
+};
+
+export type BackupFileInfo = {
+  name: string;
+  size: number;
+  modifiedAt: Date;
+};
+
+export type BackupStatus = {
+  backupDir: string;
+  files: BackupFileInfo[];
+  latestPostgres: BackupFileInfo | null;
+  backupLogTail: string;
+  stale: boolean;
+};
+
+export type SiteRuntimeStat = {
+  slug: string;
+  running: boolean;
+  cpuPercent: string | null;
+  memoryUsage: string | null;
+  memoryPercent: string | null;
+};
+
+export type HealthCheckResult =
+  | { ok: true; status: number }
+  | { ok: false; status?: number; error: string };
+
+export type ObservabilitySummary = {
+  sites: SiteRow[];
+  unhealthySites: SiteRow[];
+  recentFailedDeployments: Array<{
+    id: string;
+    slug: string;
+    status: string;
+    started_at: Date;
+    health_status: string | null;
+  }>;
+  recentErrors: Awaited<ReturnType<typeof listActivity>>;
+  backup: BackupStatus;
+  runtimeStats: SiteRuntimeStat[];
+  visitTotals: Record<string, number>;
 };
 
 export async function listPlatformState() {
@@ -362,46 +420,94 @@ export async function getSiteBySlug(slug: string) {
   return result.rows[0];
 }
 
-export async function deploySiteBySlug(slug: string) {
+export async function deploySiteBySlug(slug: string, options: DeployOptions = {}) {
   const site = await getSiteBySlug(slug);
+  const trigger = options.trigger ?? "manual";
   await syncSiteEnv(site);
-  const deployment = await pool.query(
-    "insert into deployments (site_id, status) values ($1, 'running') returning id",
-    [site.id],
+  const deployment = await pool.query<{ id: string }>(
+    "insert into deployments (site_id, status, trigger) values ($1, 'running', $2) returning id",
+    [site.id, trigger],
   );
+  const deploymentId = deployment.rows[0].id;
 
   const result = await runCommand("bash", [config.DEPLOY_SCRIPT, site.slug]);
-  const status = result.code === 0 ? "succeeded" : "failed";
+  const markers = parseDeployMarkers(result.output);
+  const commitSha = options.expectedCommitSha ?? markers.commitSha ?? null;
+  const releaseId = markers.releaseId ?? null;
+
+  let status = result.code === 0 ? "succeeded" : "failed";
+  let healthStatus: string | null = null;
+  let finalOutput = result.output;
+
+  if (result.code === 0) {
+    const health = await checkSiteHealth(site.slug, site.healthcheck_path ?? "/");
+    healthStatus = health.ok ? "healthy" : "unhealthy";
+    await updateSiteHealth(site.id, health);
+
+    if (!health.ok) {
+      status = "failed";
+      const restored = await restorePreviousRelease(site.slug, markers.previousCurrent);
+      finalOutput += `\nHealth check failed: ${formatHealthError(health)}`;
+      if (restored) {
+        finalOutput += "\nRestored previous release after failed health check.";
+        status = "rolled_back";
+        healthStatus = "rolled_back";
+      }
+      await sendAlert({
+        level: "error",
+        title: "Deploy health check failed",
+        message: `Site ${site.slug} failed health check after deploy`,
+        target: site.slug,
+        detail: formatHealthError(health),
+      });
+    }
+  } else if (markers.previousCurrent) {
+    finalOutput += "\nDeploy script attempted to restore previous release after build failure.";
+    status = "failed";
+  }
 
   await pool.query(
     `update deployments
-     set status = $1, output = $2, finished_at = now()
-     where id = $3`,
-    [status, result.output.slice(-60000), deployment.rows[0].id],
+     set status = $1, output = $2, finished_at = now(), commit_sha = $3, release_id = $4, health_status = $5
+     where id = $6`,
+    [status, finalOutput.slice(-60000), commitSha, releaseId, healthStatus, deploymentId],
   );
-  await pool.query("update sites set status = $1, updated_at = now() where id = $2", [
-    result.code === 0 ? "deployed" : "deploy_failed",
-    site.id,
-  ]);
+
+  const siteStatus =
+    status === "succeeded" ? "deployed" : status === "rolled_back" ? "deployed" : "deploy_failed";
+  await pool.query("update sites set status = $1, updated_at = now() where id = $2", [siteStatus, site.id]);
 
   await recordActivity({
     category: "deploy",
-    action: "Deploy site",
+    action: trigger === "github_webhook" ? "GitHub webhook deploy" : "Deploy site",
     target: site.slug,
-    status: result.code === 0 ? "ok" : "error",
-    detail: result.output.slice(-4000),
+    status: status === "succeeded" || status === "rolled_back" ? "ok" : "error",
+    detail: `${status}${commitSha ? ` commit=${commitSha.slice(0, 7)}` : ""}${healthStatus ? ` health=${healthStatus}` : ""}\n${finalOutput.slice(-4000)}`,
   });
+
+  if (status === "failed") {
+    await sendAlert({
+      level: "error",
+      title: "Deploy failed",
+      message: `Deploy failed for ${site.slug}`,
+      target: site.slug,
+      detail: finalOutput.slice(-2000),
+    });
+  }
 
   return {
     site,
     status,
-    output: result.output,
+    healthStatus,
+    commitSha,
+    releaseId,
+    output: finalOutput,
   };
 }
 
 export async function getDeploymentLogById(id: number) {
   const result = await pool.query(
-    `select d.id, d.status, d.output, d.started_at, d.finished_at, s.slug
+    `select d.id, d.status, d.output, d.started_at, d.finished_at, d.commit_sha, d.release_id, d.trigger, d.health_status, s.slug
      from deployments d
      join sites s on s.id = d.site_id
      where d.id = $1`,
@@ -419,13 +525,17 @@ export async function getDeploymentLogById(id: number) {
     output: string;
     started_at: Date;
     finished_at: Date | null;
+    commit_sha: string | null;
+    release_id: string | null;
+    trigger: string | null;
+    health_status: string | null;
   };
 }
 
 export async function listDeploymentLogsForSite(slug: string) {
   const site = await getSiteBySlug(slug);
   const result = await pool.query(
-    `select id, status, output, started_at, finished_at
+    `select id, status, output, started_at, finished_at, commit_sha, release_id, trigger, health_status
      from deployments
      where site_id = $1
      order by started_at desc
@@ -577,8 +687,26 @@ export async function recreateSiteBySlug(slug: string) {
     });
     throw new Error(result.output || `recreate failed for site-${slug}`);
   }
-  await recordActivity({ category: "site", action: "Recreate site", target: slug });
-  return { site, output: result.output };
+
+  const health = await checkSiteHealth(site.slug, site.healthcheck_path ?? "/");
+  await updateSiteHealth(site.id, health);
+  if (!health.ok) {
+    await sendAlert({
+      level: "warning",
+      title: "Recreate health check failed",
+      message: `Site ${site.slug} is unhealthy after recreate`,
+      target: site.slug,
+      detail: formatHealthError(health),
+    });
+  }
+
+  await recordActivity({
+    category: "site",
+    action: "Recreate site",
+    target: slug,
+    detail: health.ok ? "healthy" : `unhealthy: ${formatHealthError(health)}`,
+  });
+  return { site, output: result.output, health };
 }
 
 export async function execInSiteBySlug(slug: string, command: string) {
@@ -685,6 +813,7 @@ async function syncSiteEnv(site: SiteRow) {
     `REPO_SUBDIR=${shellQuote(site.repo_subdir ?? "")}\n` +
     `BUILD_COMMAND=${shellQuote(site.build_command ?? "")}\n` +
     `START_COMMAND=${shellQuote(site.start_command ?? "")}\n` +
+    `HEALTHCHECK_PATH=${shellQuote(site.healthcheck_path ?? "/")}\n` +
     `SERVICE_PORT=8080\n`;
   await writeFile(envPath, body, { mode: 0o600 });
 }
@@ -879,6 +1008,303 @@ function readEnvValue(contents: string, key: string) {
   }
 
   return line.slice(key.length + 1).replace(/^'|'$/g, "").replaceAll("'\\''", "'");
+}
+
+function formatHealthError(health: HealthCheckResult) {
+  if (health.ok) {
+    return `HTTP ${health.status}`;
+  }
+  return health.error ?? (health.status ? `HTTP ${health.status}` : "unknown");
+}
+
+function parseDeployMarkers(output: string) {
+  let commitSha: string | null = null;
+  let releaseId: string | null = null;
+  let previousCurrent: string | null = null;
+  for (const line of output.split("\n")) {
+    if (line.startsWith("SOMETING_COMMIT_SHA=")) {
+      commitSha = line.slice("SOMETING_COMMIT_SHA=".length).trim() || null;
+    } else if (line.startsWith("SOMETING_RELEASE_ID=")) {
+      releaseId = line.slice("SOMETING_RELEASE_ID=".length).trim() || null;
+    } else if (line.startsWith("SOMETING_PREVIOUS_CURRENT=")) {
+      previousCurrent = line.slice("SOMETING_PREVIOUS_CURRENT=".length).trim() || null;
+    }
+  }
+  return { commitSha, releaseId, previousCurrent };
+}
+
+export async function checkSiteHealth(slug: string, healthcheckPath = "/"): Promise<HealthCheckResult> {
+  const path = healthcheckPath.startsWith("/") ? healthcheckPath : `/${healthcheckPath}`;
+  const url = `http://site-${slug}:8080${path}`;
+  const attempts = 6;
+  const delayMs = 5000;
+  let lastError = "unknown error";
+  let lastStatus: number | undefined;
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+      lastStatus = res.status;
+      if (res.ok) {
+        return { ok: true as const, status: res.status };
+      }
+      lastError = `HTTP ${res.status}`;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+    if (i < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  return { ok: false as const, status: lastStatus, error: lastError };
+}
+
+async function updateSiteHealth(siteId: string | number, health: HealthCheckResult) {
+  await pool.query(
+    `update sites
+     set last_health_status = $1,
+         last_health_checked_at = now(),
+         last_health_error = $2,
+         updated_at = now()
+     where id = $3`,
+    [health.ok ? "healthy" : "unhealthy", health.ok ? null : formatHealthError(health), siteId],
+  );
+}
+
+async function restorePreviousRelease(slug: string, previousCurrent: string | null) {
+  if (!previousCurrent) {
+    return false;
+  }
+  const siteDir = join(config.HOSTING_ROOT, "sites", slug);
+  const siteEnv = join(siteDir, "site.env");
+  try {
+    await stat(previousCurrent);
+  } catch {
+    return false;
+  }
+  await runCommand("ln", ["-sfn", previousCurrent, join(siteDir, "current")]);
+  const up = await runCommand(
+    "docker",
+    ["compose", "--env-file", siteEnv, "-p", `site-${slug}`, "up", "-d", "--remove-orphans"],
+    5 * 60 * 1000,
+    { cwd: siteDir },
+  );
+  return up.code === 0;
+}
+
+export async function listSiteReleases(slug: string): Promise<{ activeRelease: string | null; releases: SiteRelease[] }> {
+  await getSiteBySlug(slug);
+  const siteDir = join(config.HOSTING_ROOT, "sites", slug);
+  const releasesDir = join(siteDir, "releases");
+  const currentLink = join(siteDir, "current");
+
+  let activeRelease: string | null = null;
+  try {
+    const target = await readlink(currentLink);
+    const resolved = resolve(siteDir, target);
+    const match = resolved.replace(/\\/g, "/").match(/\/releases\/(\d{14})/);
+    activeRelease = match?.[1] ?? basename(resolved);
+  } catch {
+    activeRelease = null;
+  }
+
+  const entries = await readdir(releasesDir, { withFileTypes: true }).catch(() => []);
+  const releaseIds = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort()
+    .reverse();
+
+  return {
+    activeRelease,
+    releases: releaseIds.map((id) => ({ id, active: id === activeRelease })),
+  };
+}
+
+export async function rollbackSiteBySlug(slug: string, releaseId: string) {
+  const site = await getSiteBySlug(slug);
+  const siteDir = join(config.HOSTING_ROOT, "sites", site.slug);
+  const releaseDir = join(siteDir, "releases", releaseId);
+  await stat(releaseDir).catch(() => {
+    throw new Error(`Release ${releaseId} not found for ${slug}.`);
+  });
+
+  const deployment = await pool.query<{ id: string }>(
+    "insert into deployments (site_id, status, trigger, release_id) values ($1, 'running', 'rollback', $2) returning id",
+    [site.id, releaseId],
+  );
+  const deploymentId = deployment.rows[0].id;
+
+  if (site.repo_subdir) {
+    await runCommand("ln", ["-sfn", join(releaseDir, site.repo_subdir), join(siteDir, "current")]);
+  } else {
+    await runCommand("ln", ["-sfn", releaseDir, join(siteDir, "current")]);
+  }
+
+  const siteEnv = join(siteDir, "site.env");
+  const up = await runCommand(
+    "docker",
+    ["compose", "--env-file", siteEnv, "-p", `site-${slug}`, "up", "-d", "--remove-orphans"],
+    5 * 60 * 1000,
+    { cwd: siteDir },
+  );
+  if (up.code !== 0) {
+    await pool.query(
+      `update deployments set status = 'failed', output = $1, finished_at = now() where id = $2`,
+      [up.output.slice(-60000), deploymentId],
+    );
+    throw new Error(up.output || "docker compose up failed during rollback");
+  }
+
+  const health = await checkSiteHealth(site.slug, site.healthcheck_path ?? "/");
+  await updateSiteHealth(site.id, health);
+  const status = health.ok ? "rolled_back" : "rollback_unhealthy";
+  const healthStatus = health.ok ? "healthy" : "unhealthy";
+
+  await pool.query(
+    `update deployments
+     set status = $1, output = $2, finished_at = now(), health_status = $3
+     where id = $4`,
+    [status, `Rolled back to release ${releaseId}`, healthStatus, deploymentId],
+  );
+
+  await recordActivity({
+    category: "deploy",
+    action: "Rollback site",
+    target: slug,
+    status: health.ok ? "ok" : "error",
+    detail: `release=${releaseId} health=${healthStatus}`,
+  });
+
+  if (!health.ok) {
+    await sendAlert({
+      level: "error",
+      title: "Rollback unhealthy",
+      message: `Rollback for ${slug} to ${releaseId} completed but health check failed`,
+      target: slug,
+      detail: formatHealthError(health),
+    });
+  }
+
+  return { site, releaseId, status, health };
+}
+
+export async function getBackupStatus(): Promise<BackupStatus> {
+  const backupDir = config.BACKUP_DIR;
+  const logPath = join(config.HOSTING_ROOT, "logs", "backup.log");
+  await mkdir(backupDir, { recursive: true });
+
+  const names = await readdir(backupDir).catch(() => []);
+  const files: BackupFileInfo[] = [];
+  for (const name of names) {
+    const filePath = join(backupDir, name);
+    const info = await stat(filePath).catch(() => null);
+    if (!info?.isFile()) {
+      continue;
+    }
+    files.push({ name, size: info.size, modifiedAt: info.mtime });
+  }
+  files.sort((a, b) => b.modifiedAt.getTime() - a.modifiedAt.getTime());
+
+  const latestPostgres =
+    files.find((file) => file.name.startsWith("postgres-") && (file.name.endsWith(".sql.gz") || file.name.endsWith(".dump"))) ??
+    null;
+
+  const stale = !latestPostgres || Date.now() - latestPostgres.modifiedAt.getTime() > 36 * 60 * 60 * 1000;
+
+  const backupLogTail = await readFile(logPath, "utf8")
+    .then((content) => content.split("\n").slice(-40).join("\n"))
+    .catch(() => "No backup log yet.");
+
+  return { backupDir, files, latestPostgres, backupLogTail, stale };
+}
+
+export async function getSiteRuntimeStats(): Promise<SiteRuntimeStat[]> {
+  const sites = await pool.query<SiteRow>("select slug from sites order by slug");
+  const stats: SiteRuntimeStat[] = [];
+
+  for (const site of sites.rows) {
+    const inspect = await runCommand("docker", ["inspect", "-f", "{{.State.Running}}", `site-${site.slug}`], 15_000);
+    const running = inspect.output.trim() === "true";
+    if (!running) {
+      stats.push({ slug: site.slug, running: false, cpuPercent: null, memoryUsage: null, memoryPercent: null });
+      continue;
+    }
+
+    const dockerStats = await runCommand(
+      "docker",
+      ["stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}", `site-${site.slug}`],
+      20_000,
+    );
+    const [cpuPercent, memoryUsage, memoryPercent] = dockerStats.output.trim().split("|");
+    stats.push({
+      slug: site.slug,
+      running: true,
+      cpuPercent: cpuPercent || null,
+      memoryUsage: memoryUsage || null,
+      memoryPercent: memoryPercent || null,
+    });
+  }
+
+  return stats;
+}
+
+export async function getObservabilitySummary(): Promise<ObservabilitySummary> {
+  const [sitesResult, failedDeployments, recentErrors, backup, runtimeStats] = await Promise.all([
+    pool.query<SiteRow>("select * from sites order by slug"),
+    pool.query<{
+      id: string;
+      slug: string;
+      status: string;
+      started_at: Date;
+      health_status: string | null;
+    }>(
+      `select d.id, s.slug, d.status, d.started_at, d.health_status
+       from deployments d
+       join sites s on s.id = d.site_id
+       where d.status in ('failed', 'rollback_unhealthy', 'rolled_back')
+       order by d.started_at desc
+       limit 10`,
+    ),
+    listActivity({ limit: 20 }),
+    getBackupStatus(),
+    getSiteRuntimeStats(),
+  ]);
+
+  const sites = sitesResult.rows;
+  const unhealthySites = sites.filter((site) => site.last_health_status === "unhealthy");
+  const visitTotals: Record<string, number> = {};
+  await Promise.all(
+    sites.map(async (site) => {
+      const visits = await getWeeklyVisits(site.slug);
+      visitTotals[site.slug] = visits.recentTotal;
+    }),
+  );
+
+  if (backup.stale) {
+    await sendAlert(
+      {
+        level: "warning",
+        title: "Backup may be stale",
+        message: backup.latestPostgres
+          ? `Latest Postgres backup is older than 36 hours (${backup.latestPostgres.name})`
+          : "No Postgres backup files found on the VPS",
+        target: "postgres",
+      },
+      "backup-stale",
+    );
+  }
+
+  return {
+    sites,
+    unhealthySites,
+    recentFailedDeployments: failedDeployments.rows,
+    recentErrors: recentErrors.filter((entry) => entry.status === "error"),
+    backup,
+    runtimeStats,
+    visitTotals,
+  };
 }
 
 function shellQuote(value: string) {
